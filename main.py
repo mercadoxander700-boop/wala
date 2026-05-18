@@ -4039,17 +4039,23 @@ def _save_active_session(chat_id, file_path: str, file_name: str, lines: list,
 
 def _update_session_progress(chat_id, progress: int):
     """Update the progress counter for an active session.
-    Also trims the persistent combo file by removing already-processed lines.
-    This ensures that on crash/restart, the file only contains remaining lines,
-    so resume never re-checks already-processed accounts."""
+    Also trims the persistent combo file every 10 accounts to reduce disk I/O.
+    
+    Progress is saved every account (precise crash recovery — no re-checking).
+    File trimming happens every 10 accounts (disk I/O is expensive).
+    On resume, if progress > 0 but file isn't trimmed yet, _auto_resume_sessions
+    skips the first 'progress' lines in memory so nothing gets re-checked."""
     with _active_sessions_lock:
         key = str(chat_id)
         if key in _active_sessions:
             _active_sessions[key]["progress"] = progress
             _flush_active_sessions()
-            # ── Trim persistent combo file: remove processed lines ──
-            # This is the KEY fix — by trimming the file as we go,
-            # on restart the bot only sees remaining lines.
+            # ── Trim persistent combo file every 10 accounts ──
+            # This reduces disk I/O while still keeping the file reasonably up-to-date.
+            # Progress counter above is always exact (every account), so even if
+            # the file isn't trimmed yet, resume will skip the right number of lines.
+            if progress % 10 != 0:
+                return
             persistent_path = _active_sessions[key].get("persistent_path", "")
             if persistent_path and os.path.exists(persistent_path):
                 try:
@@ -5217,8 +5223,9 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
                 # For display: show already_done + current progress vs original_total
                 _active_bars[bar_key]["done"]  = already_done + done_count[0]
                 _active_bars[bar_key]["speed"] = speed
-        # Persist progress every 10 accounts for crash recovery
-        if chat_id and done_count[0] % 10 == 0:
+        # Persist progress every account for precise crash recovery (no re-checking)
+        # File trimming still happens every 10 accounts to reduce disk I/O
+        if chat_id:
             _update_session_progress(chat_id, done_count[0])
 
     # ════════════════════════════════════════════════════════════════
@@ -5682,9 +5689,14 @@ def _resume_proxy_paused_users(token: str):
                 "But your combo file is empty. Please re-upload it.")
             continue
 
-        # The persistent file is already trimmed, so remaining_lines = all_lines
-        remaining_lines = all_lines
+        # The persistent file may have un-trimmed progress (trimming happens every 10 accounts).
+        # If progress > 0, skip those already-processed lines so nothing is re-checked.
         progress = sess.get("progress", 0)
+        if progress > 0 and progress < len(all_lines):
+            remaining_lines = all_lines[progress:]
+            logger.info(f"[BOT] Proxy-resume: skipping {progress} already-processed lines, {len(remaining_lines)} remaining")
+        else:
+            remaining_lines = all_lines
         total = sess.get("total_lines", len(remaining_lines))
         proxy_original_total = sess.get("original_total", progress + len(remaining_lines))
         proxy_already_done = sess.get("already_done", progress)
@@ -9764,8 +9776,13 @@ def _auto_resume_sessions(token: str):
             _remove_active_session(chat_id)
             continue
 
-        # The file is already trimmed, so remaining_lines = all_lines
-        remaining_lines = all_lines
+        # The file may have un-trimmed progress (trimming happens every 10 accounts).
+        # If progress > 0, skip those already-processed lines so nothing is re-checked.
+        if progress > 0 and progress < len(all_lines):
+            remaining_lines = all_lines[progress:]
+            logger.info(f"[BOT] Auto-resume: skipping {progress} already-processed lines, {len(remaining_lines)} remaining")
+        else:
+            remaining_lines = all_lines
         if not remaining_lines:
             _last_notify = _resume_notify_ts.get(str(chat_id), 0)
             if time.time() - _last_notify > 300:
