@@ -10226,12 +10226,14 @@ def start_bot_polling(token: str, _unused=None):
                     offset = upd["update_id"] + 1
                     _update_executor.submit(_safe_handle, upd)
             except requests.exceptions.Timeout:
-                # Long-poll timeout is normal — just loop again immediately
+                # Long-poll timeout is normal — bot is alive and polling
+                _touch_liveness()
                 continue
             except (requests.exceptions.ConnectionError,
                     requests.exceptions.ChunkedEncodingError,
                     ConnectionResetError, OSError) as e:
                 consecutive_errors += 1
+                _touch_liveness()  # bot is alive, just network issues
                 wait = min(5 * consecutive_errors, 30)
                 logger.warning(f"[BOT] Connection error #{consecutive_errors}: {e} — retrying in {wait}s")
                 time.sleep(wait)
@@ -10246,6 +10248,7 @@ def start_bot_polling(token: str, _unused=None):
                     consecutive_errors = 0
             except Exception as e:
                 consecutive_errors += 1
+                _touch_liveness()  # bot process is alive, just poll error
                 logger.warning(f"[BOT] Poll error: {e}")
                 time.sleep(5)
 
@@ -10314,30 +10317,22 @@ def _start_healthcheck_server():
                         "message": f"Bot is initializing ({int(_uptime)}s uptime — grace period)",
                     }).encode())
                     return
+                # ALWAYS return 200 while process is running.
+                # An idle bot waiting for Telegram messages IS healthy.
+                # Railway's restart policy handles actual process crashes.
+                # Returning 503 for "no activity" caused Railway to kill
+                # a perfectly healthy idle bot, triggering restart loops.
                 age = _get_liveness_age()
-                # ANTI-OVERHEAT: increased unhealthy threshold from 900s (15min) to 1800s (30min)
-                # 15min was too aggressive — during normal quiet periods the bot
-                # might not poll for 15min, causing Railway to restart unnecessarily.
-                if age > 1800:
-                    self.send_response(503)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(json.dumps({
-                        "status": "unhealthy",
-                        "reason": f"no activity for {int(age)}s",
-                    }).encode())
-                    logger.warning(f"[HEALTH] ❌ Healthcheck FAILED — no activity for {int(age)}s")
-                else:
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    active = sum(1 for s in _bot_state.values() if s == "RUNNING")
-                    self.wfile.write(json.dumps({
-                        "status": "healthy",
-                        "active_checkers": active,
-                        "liveness_age_s": int(age),
-                        "proxies": geo_rotator.total if hasattr(geo_rotator, "total") else 0,
-                    }).encode())
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                active = sum(1 for s in _bot_state.values() if s == "RUNNING")
+                self.wfile.write(json.dumps({
+                    "status": "healthy",
+                    "active_checkers": active,
+                    "liveness_age_s": int(age),
+                    "proxies": geo_rotator.total if hasattr(geo_rotator, "total") else 0,
+                }).encode())
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -10653,39 +10648,37 @@ def main():
             except Exception as e:
                 logger.debug(f"[WATCHDOG] Error: {e}")
 
-            # Periodic GC every cycle to keep memory lean on Railway
-            try:
-                gc.collect()
-            except Exception:
-                pass
+            # GC only when memory is elevated (tier > 0) — not every cycle
+            # Periodic GC every 15s wasted CPU on Railway for no benefit
+            if tier > 0:
+                try:
+                    gc.collect()
+                except Exception:
+                    pass
 
-            # Check every 15s (was 8s — less aggressive to reduce CPU overhead on Railway)
-            time.sleep(15)
+            # Check every 30s — generous interval to reduce CPU overhead
+            time.sleep(30)
 
 
     # ── Railway keep-alive heartbeat ─────────────────────────
     def _liveness_watchdog():
-        """Enhanced heartbeat + liveness watchdog (ANTI-OVERHEAT v2).
-        Every 60s: log heartbeat and check liveness.
-        ANTI-OVERHEAT: thresholds are very generous to prevent restart loops:
-        - 30 minutes: warning message (was 15 min — too aggressive)
-        - 60 minutes: self-healing restart (was 30 min — too aggressive)
-        - Minimum 30-minute cooldown between self-heal attempts
-        - Maximum 2 self-heal attempts before giving up (was 3)
-        - Startup grace: no self-heal within first 120s of boot
-        The bot touches liveness every 30s via the main loop, and on every
-        successful Telegram poll + proxy fetch. Only trigger self-heal if
-        ALL of these are dead for a sustained period.
+        """Heartbeat watchdog for 24/7 uptime.
+        Every 60s: log heartbeat. Self-heal only if polling is truly dead
+        for an extended period (2 hours). Never gives up — keeps monitoring
+        forever with escalating cooldowns between self-heal attempts.
+        
+        With the polling timeout liveness touch fix, liveness age should
+        never exceed ~35s during normal operation (even when idle).
+        If it exceeds 2 hours, something is genuinely broken.
         """
         import time as _time
-        _boot_time = _time.time()  # when this watchdog started
+        _boot_time = _time.time()
         stuck_warned = False
-        restart_loop_count = 0  # track how many self-heals we've done
-        last_selfheal_time = 0  # cooldown between self-heals (minimum 30 min)
+        restart_loop_count = 0
+        last_selfheal_time = 0
         while not shutdown_event.is_set():
-            time.sleep(60)  # check every minute
+            time.sleep(60)
             try:
-                # ── Startup grace period: don't self-heal in first 120s ──
                 uptime = _time.time() - _boot_time
                 if uptime < 120:
                     logger.debug(f"[WATCHDOG] Startup grace period ({int(uptime)}s/120s) — skipping checks")
@@ -10694,55 +10687,35 @@ def main():
                 age = _get_liveness_age()
                 active = sum(1 for s in _bot_state.values() if s == "RUNNING")
 
-                if age > 3600:  # 60 minutes — no activity at all (was 30 min)
-                    # ── Cooldown: minimum 30 minutes between self-heals ──
+                if age > 7200:  # 2 hours — something is genuinely broken
                     now = _time.time()
+                    # Escalating cooldown: 30min, 60min, 120min (doubles each time, caps at 2h)
+                    cooldown = min(1800 * (2 ** min(restart_loop_count, 2)), 7200)
                     time_since_last_heal = now - last_selfheal_time
-                    if time_since_last_heal < 1800:  # 30 min cooldown
-                        remaining = int(1800 - time_since_last_heal)
+                    if time_since_last_heal < cooldown:
+                        remaining = int(cooldown - time_since_last_heal)
                         logger.warning(
                             f"[WATCHDOG] Self-heal cooldown active — {remaining}s remaining. "
-                            f"Bot has been inactive {int(age)}s but waiting for cooldown."
+                            f"Bot inactive {int(age)}s, waiting for cooldown."
                         )
                         continue
 
                     restart_loop_count += 1
                     last_selfheal_time = now
 
-                    # If we've self-healed 2 times already, just log and wait
-                    # instead of restarting forever (was 3 — reduced to prevent overheat)
-                    if restart_loop_count > 2:
-                        logger.error(f"[WATCHDOG] Self-healed {restart_loop_count} times — stopping restart loop. Bot will stay alive but idle.")
-                        try:
-                            _tg_send(BOT_TOKEN, OWNER_ID,
-                                f"🛑 <b>Self-Heal Stopped</b>\n\n"
-                                f"Bot has self-healed {restart_loop_count} times.\n"
-                                f"Stopping auto-restart to prevent overheat.\n\n"
-                                f"📋 <b>Check Railway logs for root cause.</b>\n"
-                                f"🔄 <b>Restart the service manually when ready.</b>"
-                            )
-                        except Exception:
-                            pass
-                        # Stop the loop — don't restart anymore
-                        return
-
-                    logger.error(f"[WATCHDOG] 🚨 Bot appears DEAD — no activity for {int(age)}s! Triggering self-healing restart (attempt {restart_loop_count})...")
+                    logger.error(f"[WATCHDOG] Bot appears DEAD — no activity for {int(age)}s! Self-heal attempt #{restart_loop_count}...")
                     try:
                         _tg_send(BOT_TOKEN, OWNER_ID,
-                            f"🚨 <b>Bot Self-Heal Triggered</b>\n\n"
-                            f"No activity detected for <b>{int(age/60)} minutes</b>.\n"
-                            f"Bot is restarting itself automatically (attempt {restart_loop_count}).\n\n"
-                            f"<i>You don't need to do anything.</i>"
+                            f"🚨 <b>Bot Self-Heal #{restart_loop_count}</b>\n\n"
+                            f"No activity for <b>{int(age/60)} min</b>.\n"
+                            f"Restarting automatically..."
                         )
-                        time.sleep(3)  # give message time to send
+                        time.sleep(3)
                     except Exception:
                         pass
-                    # Self-heal: trigger clean shutdown (NOT os.execv — that caused loops)
-                    # Railway will restart the container automatically after the process exits.
                     if _is_railway():
                         _railway_redeploy()
                     else:
-                        # Non-Railway: clean exit, the crash guard in __main__ will handle retry
                         global _shutting_down
                         _shutting_down = True
                         shutdown_event.set()
@@ -10750,22 +10723,24 @@ def main():
                             for evt in _stop_events.values():
                                 evt.set()
 
-                elif age > 1800:  # 30 minutes — concerning (was 15 min)
+                elif age > 3600:  # 1 hour — warning only
                     if not stuck_warned:
-                        logger.warning(f"[WATCHDOG] ⚠️ Bot may be stuck — no activity for {int(age)}s")
+                        logger.warning(f"[WATCHDOG] Bot may be stuck — no activity for {int(age)}s")
                         stuck_warned = True
                         try:
                             _tg_send(BOT_TOKEN, OWNER_ID,
                                 f"⚠️ <b>Bot May Be Stuck</b>\n\n"
-                                f"No activity for <b>{int(age/60)} minutes</b>.\n"
-                                f"Will auto-restart in 30 min if no recovery."
+                                f"No activity for <b>{int(age/60)} min</b>.\n"
+                                f"Will auto-restart in 1h if no recovery."
                             )
                         except Exception:
                             pass
                 else:
-                    stuck_warned = False  # recovered
-                    restart_loop_count = 0  # reset on recovery
-                    logger.info(f"[HEARTBEAT] 💓 Bot alive | {active} active | liveness: {int(age)}s ago | threads: {MAX_GLOBAL_THREADS}")
+                    if stuck_warned or restart_loop_count > 0:
+                        logger.info(f"[WATCHDOG] Bot recovered — liveness age {int(age)}s")
+                    stuck_warned = False
+                    restart_loop_count = 0
+                    logger.info(f"[HEARTBEAT] Bot alive | {active} active | liveness: {int(age)}s ago | threads: {MAX_GLOBAL_THREADS}")
             except Exception:
                 pass
     threading.Thread(target=_liveness_watchdog, daemon=True, name="LivenessWatchdog").start()
@@ -10865,28 +10840,35 @@ def main():
 
 
 if __name__ == "__main__":
-    # ── Crash guard with long backoffs to prevent Railway overheat ──────────
-    # PREVIOUS: 5 retries with 30s→480s backoff — too aggressive, caused overheat loops.
-    # NOW: 3 retries with 120s→600s backoff — gives Railway breathing room.
-    # After 3 crashes, exits cleanly instead of triggering _railway_redeploy()
-    # (which caused double-restart loops with Railway's own restart policy).
-    MAX_CRASH_RETRIES = 3
-    # Backoff schedule: 2min, 5min, 10min — long enough for Railway to cool down
-    CRASH_BACKOFFS = [120, 300, 600]
+    # ── Crash guard — INFINITE retries for true 24/7 uptime ──────────────
+    # The bot retries forever with escalating backoff. If main() runs for
+    # >10 minutes before crashing, backoff resets to short (transient issue).
+    # If it keeps crashing quickly, backoff escalates to 10 min max.
+    # Railway's ON_FAILURE restart policy is the last-resort safety net.
+    #
+    # Backoff schedule: 30s → 60s → 120s → 300s → 600s (capped)
+    CRASH_BACKOFFS = [30, 60, 120, 300, 600]
     crash_count = 0
-    while crash_count < MAX_CRASH_RETRIES:
+    _last_main_start = 0
+    while True:
         try:
             _shutting_down = False  # reset for new attempt
             shutdown_event.clear()   # reset shutdown flag for restart
             gc.collect()  # clean up before each run
+            _last_main_start = time.time()
             main()
-            crash_count = 0  # reset on clean exit (shutdown_event set)
-            break
-        except SystemExit:
-            # SystemExit = intentional shutdown (SIGTERM handled gracefully, etc.)
-            # Do NOT retry — this is NOT a crash.
+            # Clean exit (shutdown_event set) — restart immediately
+            # This handles self-heal shutdowns: bot exits cleanly, restarts fresh
+            crash_count = 0
             logger = logging.getLogger(__name__)
-            logger.info("[MAIN] Bot exited via SystemExit — intentional shutdown, not a crash.")
+            logger.info("[MAIN] Bot exited cleanly — restarting in 5s...")
+            time.sleep(5)
+            continue
+        except SystemExit:
+            # SystemExit = intentional shutdown (SIGTERM from Railway, etc.)
+            # Exit cleanly — Railway's ON_FAILURE policy will restart if needed.
+            logger = logging.getLogger(__name__)
+            logger.info("[MAIN] Bot exited via SystemExit — intentional shutdown.")
             break
         except KeyboardInterrupt:
             bot_console.print(f"\n[yellow]⚠️  Bot stopped by user[/yellow]")
@@ -10894,39 +10876,23 @@ if __name__ == "__main__":
         except MemoryError:
             gc.collect()
             crash_count += 1
-            backoff = CRASH_BACKOFFS[min(crash_count - 1, len(CRASH_BACKOFFS) - 1)]
-            bot_console.print(f"[red]✘ Memory error (crash {crash_count}/{MAX_CRASH_RETRIES}) — forcing GC and restarting in {backoff}s...[/red]")
+            # If bot ran >10 min before crashing, reset backoff (transient OOM)
+            run_duration = time.time() - _last_main_start
+            if run_duration > 600:
+                crash_count = 1
+            backoff_s = CRASH_BACKOFFS[min(crash_count - 1, len(CRASH_BACKOFFS) - 1)]
             logger = logging.getLogger(__name__)
-            logger.error(f"[MAIN] ✘ Memory error (crash {crash_count}/{MAX_CRASH_RETRIES}) — restarting in {backoff}s...")
-            time.sleep(backoff)
+            logger.error(f"[MAIN] ✘ Memory error (crash #{crash_count}, ran {int(run_duration)}s) — restarting in {backoff_s}s...")
+            bot_console.print(f"[red]✘ Memory error — restarting in {backoff_s}s...[/red]")
+            time.sleep(backoff_s)
         except Exception as e:
             crash_count += 1
+            run_duration = time.time() - _last_main_start
+            # If bot ran >10 min before crashing, reset backoff (transient error)
+            if run_duration > 600:
+                crash_count = 1
             logger = logging.getLogger(__name__)
-            logger.error(f"[MAIN] ✘ Unexpected error (crash {crash_count}/{MAX_CRASH_RETRIES}): {e}", exc_info=True)
-            backoff = CRASH_BACKOFFS[min(crash_count - 1, len(CRASH_BACKOFFS) - 1)]
-            bot_console.print(f"[red]✘ Restarting in {backoff}s... (attempt {crash_count}/{MAX_CRASH_RETRIES})[/red]")
-            logger.error(f"[MAIN] Retry {crash_count}/{MAX_CRASH_RETRIES} in {backoff}s...")
-            time.sleep(backoff)
-    else:
-        # ── All retries exhausted — exit cleanly, DON'T trigger redeploy ──
-        # Previously triggered _railway_redeploy() which caused ANOTHER restart,
-        # creating double-restart loops with Railway's own policy. That overheat
-        # loop is exactly what we're fixing. Now we just exit — the user can
-        # restart manually or Railway's restartPolicy handles it with long cooldown.
-        logger = logging.getLogger(__name__)
-        logger.error(f"[MAIN] ✘ Bot crashed {MAX_CRASH_RETRIES} times — exiting cleanly to prevent overheat loop.")
-        bot_console.print(f"[bold red]✘ Crashed {MAX_CRASH_RETRIES} times — exiting cleanly (no auto-redeploy to prevent overheat).[/bold red]")
-
-        try:
-            _tg_send(BOT_TOKEN, OWNER_ID,
-                f"🛑 <b>Bot Stopped After {MAX_CRASH_RETRIES} Crashes</b>\n\n"
-                f"Auto-restart disabled to prevent overheat.\n"
-                f"Check Railway logs for root cause.\n\n"
-                f"🔄 <b>Restart manually when ready.</b>"
-            )
-            time.sleep(3)
-        except Exception:
-            pass
-
-        # Just exit — do NOT trigger _railway_redeploy() or os.execv.
-        # This prevents the restart loop that was overheating Railway.
+            logger.error(f"[MAIN] ✘ Unexpected error (crash #{crash_count}, ran {int(run_duration)}s): {e}", exc_info=True)
+            backoff_s = CRASH_BACKOFFS[min(crash_count - 1, len(CRASH_BACKOFFS) - 1)]
+            bot_console.print(f"[red]✘ Restarting in {backoff_s}s... (crash #{crash_count})[/red]")
+            time.sleep(backoff_s)

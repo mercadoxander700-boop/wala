@@ -2,10 +2,13 @@
 # Docs: https://docs.railway.com/config-as-code/reference
 
 [deploy]
-# NEVER = let the bot's internal crash guard handle all retries.
-# ON_FAILURE caused Railway to restart on top of the bot's own retries,
-# creating double-restart loops that overheat the container.
-restartPolicyType = "NEVER"
-restartPolicyMaxRetries = 3
+# ON_FAILURE = Railway auto-restarts if the process crashes/exits non-zero.
+# Combined with the bot's internal infinite crash guard (which handles transient
+# errors with backoff), this ensures true 24/7 uptime:
+#   - Transient crashes: bot's internal guard retries with backoff
+#   - Fatal crashes (OOM kill, segfault): Railway restarts the container
+# maxRetries = 10 gives Railway plenty of attempts before giving up.
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
 healthcheckPath = "/health"
 healthcheckTimeout = 300
