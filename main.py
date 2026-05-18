@@ -165,7 +165,7 @@ FREE_THREADS_PER_USER = 2     # Free key users: 2 threads — queued, waits for 
 # Max users running the checker simultaneously
 MAX_CONCURRENT_USERS = 10     # 10 users supported concurrently
 # VIP users get higher thread count for faster checking — NO QUEUE
-VIP_THREADS_PER_USER = 3      # VIP users: 3 threads — instant, no queuing
+VIP_THREADS_PER_USER = 10     # VIP users: 10 threads — instant, no queuing
 # Legacy alias — kept for backward compat in some messages
 MAX_THREADS_PER_USER = FREE_THREADS_PER_USER
 
