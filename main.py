@@ -3345,8 +3345,8 @@ def _is_choreo() -> bool:
     return bool(os.environ.get("CHOREO_DEPLOYMENT") or os.environ.get("CHOREO_COMPONENT_NAME"))
 
 def _is_cloud() -> bool:
-    """Detect if running on any cloud platform (Railway, Choreo, etc.)."""
-    return _is_railway() or _is_choreo()
+    """Detect if running on any cloud platform (Railway, etc.)."""
+    return _is_railway()
 
 def _env_config() -> dict:
     """Build a config dict from environment variables (if set)."""
@@ -10016,28 +10016,21 @@ def start_bot_polling(token: str, _unused=None):
 # ═══════════════════════════════════════════════════════════════════
 #  HEALTHCHECK SERVER — lightweight HTTP server for liveness
 #  Railway pings /health every 30s; if it fails 3 times → auto-restart
-#  Choreo (K8s) uses liveness probes on /health; if it fails → pod restart
 # ═══════════════════════════════════════════════════════════════════
 _healthcheck_server = None  # reference to HTTPServer for cleanup
 
 def _start_healthcheck_server():
     """Start a lightweight HTTP server for healthchecks.
     Responds 200 if bot is alive, 503 if the main loop appears stuck.
-    Works with Railway, Choreo (K8s liveness probes), and any platform that sets PORT."""
+    Works with Railway and any platform that sets PORT."""
     from http.server import HTTPServer, BaseHTTPRequestHandler
     import traceback
 
-    port = int(os.environ.get("PORT", 0))  # Railway/Choreo set PORT automatically
+    port = int(os.environ.get("PORT", 0))  # Railway sets PORT automatically
 
     if not port:
-        if _is_choreo():
-            # On Choreo, always start the healthcheck server on port 8080
-            # This ensures the K8s liveness probe can reach /health
-            port = 8080
-            logger.debug("[HEALTH] No PORT env var on Choreo — defaulting to 8080")
-        else:
-            logger.debug("[HEALTH] No PORT env var — healthcheck server disabled")
-            return
+        logger.debug("[HEALTH] No PORT env var — healthcheck server disabled")
+        return
 
     class HealthHandler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -10406,14 +10399,8 @@ def main():
                         pass
                     # Self-heal: trigger clean shutdown (NOT os.execv — that caused loops)
                     # Railway will restart the container automatically after the process exits.
-                    # Choreo (Kubernetes) will also restart the pod automatically on exit.
                     if _is_railway():
                         _railway_redeploy()
-                    elif _is_choreo():
-                        # On Choreo: clean exit → K8s restarts the pod automatically
-                        global _shutting_down
-                        _shutting_down = True
-                        shutdown_event.set()
                     else:
                         # Non-Railway: clean exit, the crash guard in __main__ will handle retry
                         global _shutting_down
@@ -10599,19 +10586,6 @@ if __name__ == "__main__":
             except Exception:
                 pass
             _railway_redeploy()
-        elif _is_choreo():
-            # On Choreo: clean exit → Kubernetes restarts the pod automatically
-            try:
-                _tg_send(BOT_TOKEN, OWNER_ID,
-                    f"🚨 <b>Self-Healing Restart</b>\n\n"
-                    f"Bot crashed {MAX_CRASH_RETRIES} times internally.\n"
-                    f"Choreo (K8s) will restart the pod automatically.\n\n"
-                    f"<i>Bot will be back online shortly.</i>"
-                )
-                time.sleep(3)
-            except Exception:
-                pass
-            # Clean exit — K8s deployment will restart the pod
         else:
             # Not on Railway: let the process exit cleanly.
             # If running in a process manager (systemd, etc.), it will restart automatically.
