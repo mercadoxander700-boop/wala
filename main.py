@@ -115,7 +115,7 @@ FREE_THREADS_PER_USER = 2     # Free key users: 2 threads — queued, waits for 
 # Max users running the checker simultaneously
 MAX_CONCURRENT_USERS = 10     # 10 users supported concurrently
 # VIP users get higher thread count for faster checking — NO QUEUE
-VIP_THREADS_PER_USER = 10     # VIP users: 10 threads — instant, no queuing
+VIP_THREADS_PER_USER = 3      # VIP users: 3 threads — instant, no queuing
 # Legacy alias — kept for backward compat in some messages
 MAX_THREADS_PER_USER = FREE_THREADS_PER_USER
 
@@ -5184,7 +5184,9 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
     # ════════════════════════════════════════════════════════════════
 
     # Create priority queue with the user's thread allocation
-    pq = VipFreeQueue(vip_threads or 1, free_threads or 1)
+    # Pass actual thread counts (0 means no workers of that type will be started).
+    # VipFreeQueue handles 0 gracefully — no workers = no semaphore issues.
+    pq = VipFreeQueue(max(vip_threads, 1), max(free_threads, 1))
 
     # Add all accounts to the appropriate queue based on user tier
     # ALL accounts from this user go to the SAME queue (VIP or Free)
@@ -5202,6 +5204,13 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
     # KEY: VIP semaphore is acquired BEFORE pulling from queue.
     # Since # of VIP workers = vip_threads, the semaphore always has slots
     # available → NO QUEUE for VIP accounts.
+    #
+    # CRITICAL FIX: _global_thread_sem is acquired ONLY after confirming
+    # an account is available. Previously it was acquired before the account
+    # check, which meant if stop_event/shutdown_event was set or the account
+    # was None, the semaphore could be released without being acquired
+    # (via the finally block in error paths), corrupting the semaphore count
+    # and causing OTHER users' checkers to restart.
     def vip_worker():
         while not pq.should_stop():
             # Step 1: Acquire VIP slot (instant — dedicated VIP pool)
@@ -5218,7 +5227,7 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
             # Step 2: Get next VIP account
             account = pq.get_vip()
             if account is None:
-                # No account in queue — release slot and wait
+                # No account in queue — release tier slot and wait
                 pq.release_vip_slot()
                 if pq.vip_remaining == 0:
                     break
@@ -5229,26 +5238,41 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
                 time.sleep(0.05)
                 continue
 
-            # Step 3: Acquire global VPS slot, then process
+            # Step 3: Check stop BEFORE acquiring global slot
+            if stop_event and stop_event.is_set():
+                pq.release_vip_slot()
+                pq.mark_vip_done()
+                return
+            if shutdown_event.is_set():
+                pq.release_vip_slot()
+                pq.mark_vip_done()
+                return
+
+            # Step 4: Acquire global thread slot, then process
+            # Only acquire AFTER confirming we have an account and we're not stopping.
+            # This prevents semaphore corruption that causes other users to restart.
             _global_thread_sem.acquire()
             try:
-                if stop_event and stop_event.is_set():
-                    return
-                if shutdown_event.is_set():
-                    return
                 _do_account(account['line'], account['idx'])
             except Exception as e:
                 logger.debug(f"[VIP-WORKER] Error: {e}")
             finally:
                 _global_thread_sem.release()
-                pq.release_vip_slot()
-                pq.mark_vip_done()
-                _update_progress()
+
+            # Step 5: Release tier slot and mark done (OUTSIDE global sem)
+            pq.release_vip_slot()
+            pq.mark_vip_done()
+            _update_progress()
 
     # ── Free Worker: Acquires slot FIRST (BLOCKS if full = QUEUE), then processes ──
     # KEY: Free semaphore is acquired BEFORE pulling from queue.
     # If all free_threads slots are taken, the worker WAITS here — this IS the queue.
     # Once a slot opens up, the worker grabs the next account and processes it.
+    #
+    # CRITICAL FIX: Same as vip_worker — _global_thread_sem is acquired ONLY
+    # after confirming an account is available and we're not stopping. This
+    # prevents the semaphore count corruption that caused checker restarts
+    # when multiple users (VIP + Free) were running simultaneously.
     def free_worker():
         while not pq.should_stop():
             # Step 1: Acquire Free slot — THIS IS THE QUEUE
@@ -5266,7 +5290,7 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
             # Step 2: Get next Free account (now that we have a slot)
             account = pq.get_free()
             if account is None:
-                # No account in queue — release slot and wait
+                # No account in queue — release tier slot and wait
                 pq.release_free_slot()
                 if pq.free_remaining == 0:
                     break
@@ -5277,21 +5301,31 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
                 time.sleep(0.05)
                 continue
 
-            # Step 3: Acquire global VPS slot, then process
+            # Step 3: Check stop BEFORE acquiring global slot
+            if stop_event and stop_event.is_set():
+                pq.release_free_slot()
+                pq.mark_free_done()
+                return
+            if shutdown_event.is_set():
+                pq.release_free_slot()
+                pq.mark_free_done()
+                return
+
+            # Step 4: Acquire global thread slot, then process
+            # Only acquire AFTER confirming we have an account and we're not stopping.
+            # This prevents semaphore corruption that causes other users to restart.
             _global_thread_sem.acquire()
             try:
-                if stop_event and stop_event.is_set():
-                    return
-                if shutdown_event.is_set():
-                    return
                 _do_account(account['line'], account['idx'])
             except Exception as e:
                 logger.debug(f"[FREE-WORKER] Error: {e}")
             finally:
                 _global_thread_sem.release()
-                pq.release_free_slot()
-                pq.mark_free_done()
-                _update_progress()
+
+            # Step 5: Release tier slot and mark done (OUTSIDE global sem)
+            pq.release_free_slot()
+            pq.mark_free_done()
+            _update_progress()
 
     # ── Start workers ──
     workers = []
