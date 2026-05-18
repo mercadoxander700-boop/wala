@@ -177,6 +177,7 @@ _global_thread_sem = threading.Semaphore(MAX_GLOBAL_THREADS)
 # ══════════════════════════════════════════════════════════════
 PROXY_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxy")
 SAVED_COMBOS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_combos")
+SAVED_RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_results")
 SAVED_PROXIES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_proxies")
 
 def _init_proxy_folder():
@@ -3348,7 +3349,8 @@ def _cleanup_stale_files():
     """
     Delete leftover combo/ and *_results/ folders from previous crashes.
     Called once at bot startup to recover disk space.
-    NOTE: Does NOT touch saved_combos/ or saved_proxies/ — those are persistent across restarts.
+    NOTE: Does NOT touch saved_combos/, saved_results/, or saved_proxies/ —
+    those are persistent across restarts for auto-resume and result preservation.
     """
     import shutil, glob
     base = os.path.dirname(os.path.abspath(__file__))
@@ -3365,9 +3367,13 @@ def _cleanup_stale_files():
             except Exception:
                 pass
 
-    # *_results/ folders — unzipped result dirs (base dir and inside combo/)
+    # *_results/ folders in base dir and combo/ — old ephemeral results (safe to delete)
+    # saved_results/ is NOT touched — it persists across restarts for result preservation
     for pattern in [os.path.join(base, "*_results"), os.path.join(combo_dir, "*_results")]:
         for d in glob.glob(pattern):
+            # Skip the saved_results directory itself
+            if os.path.abspath(d) == os.path.abspath(SAVED_RESULTS_DIR):
+                continue
             try:
                 shutil.rmtree(d, ignore_errors=True)
                 logger.warning(f"[CLEANUP] Removed stale results folder: {os.path.basename(d)}")
@@ -3375,8 +3381,9 @@ def _cleanup_stale_files():
                 pass
 
     # saved_combos/ is NEVER cleaned — these persist across restarts for auto-resume
+    # saved_results/ is NEVER cleaned at startup — results persist for resume & final zip
     # saved_proxies/ is NEVER cleaned — these persist across restarts for proxy auto-restore
-    # Individual combo files are removed by _remove_active_session() when checks complete
+    # Individual files are removed by _remove_active_session() when checks complete
 
 
 # ══════════════════════════════════════════════════════════════
@@ -4054,7 +4061,8 @@ _active_sessions_lock = threading.Lock()
 
 def _save_active_session(chat_id, file_path: str, file_name: str, lines: list,
                          user_data: dict, progress: int = 0,
-                         original_total: int = 0, already_done: int = 0):
+                         original_total: int = 0, already_done: int = 0,
+                         result_folder: str = ""):
     """Persist an active checking session to disk + KeyVault API for crash recovery.
     Also saves a copy of the combo file to saved_combos/ AND KeyVault API
     so it survives Railway restarts (ephemeral filesystem).
@@ -4063,6 +4071,7 @@ def _save_active_session(chat_id, file_path: str, file_name: str, lines: list,
     'progress' is the number of lines already processed in THIS run (since last trim).
     'original_total' is the total from the VERY FIRST run (e.g. 100 for a 100-line file).
     'already_done' is the total processed across ALL runs (before this session started).
+    'result_folder' is the path to the persistent result folder for this session.
     On resume, original_total and already_done allow showing "50/100" instead of "0/50".
     """
     # ── Save combo file to persistent directory ──
@@ -4085,6 +4094,7 @@ def _save_active_session(chat_id, file_path: str, file_name: str, lines: list,
             "progress": progress,
             "original_total": original_total or len(lines),
             "already_done": already_done,
+            "result_folder": result_folder,
             "level": user_data.get("level", [1]),
             "clean_filter": user_data.get("clean_filter", "both"),
             "hits_id": user_data.get("hits_id", chat_id),
@@ -4212,9 +4222,11 @@ def _update_session_progress(chat_id, progress: int):
                 logger.debug(f"[BOT] Could not sync combo progress to KeyVault: {e}")
 
 
-def _remove_active_session(chat_id, delete_combo=True):
+def _remove_active_session(chat_id, delete_combo=True, delete_results=True):
     """Remove a completed/stopped session from disk AND KeyVault API.
-    Also removes the persistent combo file unless delete_combo=False."""
+    Also removes the persistent combo file unless delete_combo=False.
+    Also removes the persistent result folder unless delete_results=False."""
+    import shutil as _shutil
     key = str(chat_id)
     with _active_sessions_lock:
         sess = _active_sessions.pop(key, None)
@@ -4243,6 +4255,15 @@ def _remove_active_session(chat_id, delete_combo=True):
                 if api and api.enabled:
                     combo_key = f"combo_{chat_id}_{fname}"
                     api.delete_state(combo_key)
+            except Exception:
+                pass
+    # Clean up persistent result folder (after zip has been sent)
+    if delete_results and sess:
+        rf = sess.get("result_folder", "")
+        if rf and os.path.isdir(rf):
+            try:
+                _shutil.rmtree(rf, ignore_errors=True)
+                logger.debug(f"[BOT] Removed persistent results: {rf}")
             except Exception:
                 pass
 
@@ -4668,9 +4689,15 @@ def _handle_file(token: str, chat_id, message: dict, from_user: dict = None):
     with _state_lock:
         _bot_state[chat_id] = "RUNNING"
 
+    # ── Pre-compute persistent result folder so it's stored in session metadata ──
+    _base_name = os.path.splitext(os.path.basename(clean_path))[0]
+    _initial_result_folder = os.path.join(SAVED_RESULTS_DIR, f"{chat_id}_{_base_name}")
+    os.makedirs(_initial_result_folder, exist_ok=True)
+
     # ── Save active session for auto-resume on crash ───────────
     _save_active_session(chat_id, clean_path, file_name, clean_lines, d,
-                         original_total=len(clean_lines), already_done=0)
+                         original_total=len(clean_lines), already_done=0,
+                         result_folder=_initial_result_folder)
 
     # ── Create a per-user stop event ───────────────────────────
     stop_evt = threading.Event()
@@ -4711,11 +4738,14 @@ def _handle_file(token: str, chat_id, message: dict, from_user: dict = None):
             except Exception:
                 pass
 
-        # ── Delete result folder (read from shared container) ───
+        # ── Delete result folder ONLY if it's NOT in saved_results/ ───
+        # Persistent results in saved_results/ survive crashes for auto-resume;
+        # they are cleaned up by _remove_active_session() after zip is sent.
         try:
             rf = _rf[0]
             if rf and os.path.isdir(rf):
-                shutil.rmtree(rf, ignore_errors=True)
+                if not os.path.abspath(rf).startswith(os.path.abspath(SAVED_RESULTS_DIR)):
+                    shutil.rmtree(rf, ignore_errors=True)
         except Exception:
             pass
 
@@ -4756,7 +4786,8 @@ def _handle_file(token: str, chat_id, message: dict, from_user: dict = None):
             stats, result_folder = _run_checker_for_file(
                 clean_path, user_telegram_config,
                 chat_id=chat_id, label=label,
-                stop_event=stop_evt
+                stop_event=stop_evt,
+                result_folder=_initial_result_folder
             )
             _rf[0] = result_folder   # store in shared container for _cleanup_files
             stopped = stop_evt.is_set()
@@ -4779,7 +4810,8 @@ def _handle_file(token: str, chat_id, message: dict, from_user: dict = None):
             with _stop_events_lock:
                 _stop_events.pop(chat_id, None)
             # Remove from active sessions (no longer needs resume)
-            _remove_active_session(chat_id)
+            # Keep result folder alive until zip is sent below
+            _remove_active_session(chat_id, delete_results=False)
 
             if stopped:
                 _tg_send(token, chat_id,
@@ -4830,8 +4862,17 @@ def _handle_file(token: str, chat_id, message: dict, from_user: dict = None):
                 _tg_send(token, chat_id,
                     "📭 <b>No result files</b> — no valid hits found.")
 
-            # ── Delete combo files + result folder ──────────────
+            # ── Delete combo files (result folder kept for zip above) ──
             _cleanup_files()
+
+            # ── Now safe to delete persistent result folder after zip sent ──
+            import shutil as _shutil_rf
+            try:
+                rf = _rf[0]
+                if rf and os.path.isdir(rf):
+                    _shutil_rf.rmtree(rf, ignore_errors=True)
+            except Exception:
+                pass
 
             # Force GC after each check run to free memory on Railway
             gc.collect()
@@ -5217,14 +5258,21 @@ def _get_user_tier(chat_id) -> str:
     return cached_tier or "free"
 
 
-def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, label: str = "user", stop_event=None, original_total: int = 0, already_done: int = 0) -> tuple:
-    """Returns (stats_dict, result_folder_path)"""
+def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, label: str = "user", stop_event=None, original_total: int = 0, already_done: int = 0, result_folder: str = "") -> tuple:
+    """Returns (stats_dict, result_folder_path).
+    If result_folder is provided (e.g. from a resumed session), reuse it
+    so partial results from before the crash are preserved (append mode)."""
     if not os.path.exists(filepath):
         logger.error(f"[BOT] File not found: {filepath}")
         return {}, ""
 
-    base          = os.path.splitext(os.path.basename(filepath))[0]
-    result_folder = os.path.join(os.path.dirname(os.path.abspath(filepath)), f"{base}_results")
+    if not result_folder:
+        # Use persistent saved_results/ dir so results survive crashes
+        base = os.path.splitext(os.path.basename(filepath))[0]
+        if chat_id:
+            result_folder = os.path.join(SAVED_RESULTS_DIR, f"{chat_id}_{base}")
+        else:
+            result_folder = os.path.join(os.path.dirname(os.path.abspath(filepath)), f"{base}_results")
     os.makedirs(result_folder, exist_ok=True)
 
     accounts = []
@@ -5964,7 +6012,7 @@ def _resume_proxy_paused_users(token: str):
                     _bot_state[cid] = "AWAIT_FILE"
                 with _stop_events_lock:
                     _stop_events.pop(cid, None)
-                _remove_active_session(cid)
+                _remove_active_session(cid, delete_results=False)
 
                 if stopped:
                     _tg_send(token, cid,
@@ -6015,6 +6063,14 @@ def _resume_proxy_paused_users(token: str):
                 try:
                     if os.path.exists(rpath):
                         os.remove(rpath)
+                except Exception:
+                    pass
+
+                # Now safe to delete persistent result folder after zip sent
+                import shutil as _shutil_proxy
+                try:
+                    if result_folder and os.path.isdir(result_folder):
+                        _shutil_proxy.rmtree(result_folder, ignore_errors=True)
                 except Exception:
                     pass
 
@@ -9914,6 +9970,7 @@ def _auto_resume_sessions(token: str):
         file_name  = sess.get("file_name", "unknown.txt")
         progress   = sess.get("progress", 0)
         total      = sess.get("total_lines", 0)
+        saved_result_folder = sess.get("result_folder", "")
 
         if not chat_id:
             continue
@@ -10064,9 +10121,11 @@ def _auto_resume_sessions(token: str):
             _bot_state[chat_id] = "RUNNING"
 
         # Update session with new file path (also re-saves to persistent dir)
-        # Pass original_total and already_done so progress shows correctly (e.g. 50/100)
+        # Pass original_total, already_done, and result_folder so progress shows correctly
+        # and results accumulate in the same folder across restarts
         _save_active_session(chat_id, resume_path, file_name, remaining_lines, d, 0,
-                             original_total=saved_original_total, already_done=already_done)
+                             original_total=saved_original_total, already_done=already_done,
+                             result_folder=saved_result_folder)
 
         stop_evt = threading.Event()
         with _stop_events_lock:
@@ -10074,12 +10133,14 @@ def _auto_resume_sessions(token: str):
 
         def _resume_run(cid=chat_id, rpath=resume_path, tg_cfg=user_telegram_config,
                         se=stop_evt, fn=file_name, rem=len(remaining_lines),
-                        ot=saved_original_total, ad=already_done):
+                        ot=saved_original_total, ad=already_done,
+                        srf=saved_result_folder):
             try:
                 label = f"resume:{cid}"
                 stats, result_folder = _run_checker_for_file(
                     rpath, tg_cfg, chat_id=cid, label=label, stop_event=se,
-                    original_total=ot, already_done=ad
+                    original_total=ot, already_done=ad,
+                    result_folder=srf
                 )
                 stopped = se.is_set()
             except Exception as e:
@@ -10092,7 +10153,7 @@ def _auto_resume_sessions(token: str):
                     _bot_state[cid] = "AWAIT_FILE"
                 with _stop_events_lock:
                     _stop_events.pop(cid, None)
-                _remove_active_session(cid)
+                _remove_active_session(cid, delete_results=False)
 
                 if stopped:
                     _tg_send(token, cid,
@@ -10143,6 +10204,14 @@ def _auto_resume_sessions(token: str):
                 try:
                     if os.path.exists(rpath):
                         os.remove(rpath)
+                except Exception:
+                    pass
+
+                # Now safe to delete persistent result folder after zip sent
+                import shutil as _shutil_resume
+                try:
+                    if result_folder and os.path.isdir(result_folder):
+                        _shutil_resume.rmtree(result_folder, ignore_errors=True)
                 except Exception:
                     pass
 
