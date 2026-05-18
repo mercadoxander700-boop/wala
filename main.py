@@ -1567,71 +1567,84 @@ class LiveStats:
             )
 
     def get_fancy_telegram_progress(self):
-        """Get the fancy checking display for Telegram with bars, stats, level & server distribution."""
+        """Get the fancy checking display for Telegram with bars, stats, speed & distributions."""
         with self.lock:
             if self.total_accounts <= 0:
                 return None
 
             # For resume: show already_done + current progress vs original total
             display_processed = self.already_done + self.total_processed
+            remaining = self.total_accounts - display_processed
             pct = display_processed / self.total_accounts if self.total_accounts > 0 else 0
             pct_int = int(pct * 100)
-            bar = self._make_bar(display_processed, self.total_accounts, 10)
+            bar = self._make_bar(display_processed, self.total_accounts, 15)
 
-            lines = [
-                f"⚡️ Checking…",
-                f"━━━━━━━━━━━━━━━━━━━━",
-                f"⏳ [{bar}] {pct_int}%  {display_processed:,}/{self.total_accounts:,}",
-                f"━━━━━━━━━━━━━━━━━━━━",
-                f"✅ Valid      : {self.valid_count:,}",
-                f"❌ Invalid    : {self.invalid_count:,}",
-                f"✨ Clean      : {self.clean_count:,}",
-                f"⚠️  Not Clean  : {self.not_clean_count:,}",
-                f"🎮 Has CODM   : {self.has_codm_count:,}",
-                f"📭 No CODM    : {self.no_codm_count:,}",
-                f"━━━━━━━━━━━━━━━━━━━━",
+            # Speed & ETA
+            speed_str = f"{self.current_speed:.1f}/s" if self.current_speed > 0 else "..."
+            elapsed = time.time() - self.start_time if self.start_time else 0
+            elapsed_str = self.format_time(elapsed)
+            eta_str = self.format_time(self.eta_seconds) if self.eta_seconds > 0 else "..."
+            hit_rate = f"{(self.valid_count / display_processed * 100):.1f}%" if display_processed > 0 else "0.0%"
+            hit_bar_filled = int(self.valid_count / display_processed * 10) if display_processed > 0 else 0
+            hit_bar = "\u2588" * hit_bar_filled + "\u2591" * (10 - hit_bar_filled)
+
+            sep = "\u2501" * 28
+
+            lines_list = [
+                f"\u26a1\ufe0f <b>Checking\u2026</b>",
+                f"{sep}",
+                f"\u23f3 [{bar}] {pct_int}%  {display_processed:,}/{self.total_accounts:,}  ({remaining:,} left)",
+                f"{sep}",
+                f"\u2705 <b>Valid:</b>      {self.valid_count:,}",
+                f"\u274c <b>Invalid:</b>    {self.invalid_count:,}",
+                f"\u2728 <b>Clean:</b>     {self.clean_count:,}",
+                f"\u26a0\ufe0f <b>Not Clean:</b> {self.not_clean_count:,}",
+                f"\U0001f3ae <b>Has CODM:</b>  {self.has_codm_count:,}",
+                f"\U0001f6ab <b>No CODM:</b>   {self.no_codm_count:,}",
+                f"{sep}",
+                f"\U0001f3af <b>Hit Rate:</b> [{hit_bar}] {hit_rate}",
+                f"\u26a1 <b>Speed:</b> {speed_str}  \u23f1 <b>Elapsed:</b> {elapsed_str}  \u23f3 <b>ETA:</b> {eta_str}",
+                f"{sep}",
             ]
 
-            # Level Distribution (only if we have CODM data)
+            # Level Distribution
             total_with_level = sum(self.level_distribution.values())
             if total_with_level > 0:
-                lines.append(f"━━━━━━━━━━━━━━━━━━━━")
-                lines.append(f"📊 Level Distribution")
+                lines_list.append(f"\U0001f4ca <b>Level Distribution</b>")
                 for range_key in ["1-50", "51-100", "101-150", "151-200",
                                   "201-250", "251-300", "301-350", "351+"]:
                     count = self.level_distribution[range_key]
                     pct_lvl = (count / total_with_level * 100) if total_with_level > 0 else 0
                     bar_lvl = self._make_bar(count, total_with_level, 10)
-                    lines.append(f"  {range_key:<7} : [{bar_lvl}] {count} ({pct_lvl:.1f}%)")
-                lines.append(f"━━━━━━━━━━━━━━━━━━━━")
+                    lines_list.append(f"  {range_key:<7} [{bar_lvl}] {count} ({pct_lvl:.1f}%)")
+                lines_list.append(f"{sep}")
 
-            # Server Distribution (only if we have region data)
+            # Server Distribution
             if self.server_distribution:
-                lines.append(f"🌏 Server Distribution")
+                lines_list.append(f"\U0001f310 <b>Server Distribution</b>")
                 sorted_servers = sorted(self.server_distribution.items(), key=lambda x: x[1], reverse=True)
                 total_servers = sum(v for _, v in sorted_servers)
                 for region, count in sorted_servers:
                     pct_srv = (count / total_servers * 100) if total_servers > 0 else 0
                     bar_srv = self._make_bar(count, total_servers, 10)
-                    lines.append(f"  {region:<5} : [{bar_srv}] {count} ({pct_srv:.1f}%)")
-                lines.append(f"━━━━━━━━━━━━━━━━━━━━")
+                    lines_list.append(f"  {region:<5} [{bar_srv}] {count} ({pct_srv:.1f}%)")
+                lines_list.append(f"{sep}")
 
-            # Country Distribution (only if we have country data)
+            # Country Distribution
             if self.country_distribution:
-                lines.append(f"🌍 Country Distribution")
+                lines_list.append(f"\U0001f30d <b>Country Distribution</b>")
                 sorted_countries = sorted(self.country_distribution.items(), key=lambda x: x[1], reverse=True)
                 total_countries = sum(v for _, v in sorted_countries)
                 for cname, count in sorted_countries[:15]:
                     pct_c = (count / total_countries * 100) if total_countries > 0 else 0
                     bar_c = self._make_bar(count, total_countries, 10)
-                    lines.append(f"  {cname:<5} : [{bar_c}] {count} ({pct_c:.1f}%)")
+                    lines_list.append(f"  {cname:<5} [{bar_c}] {count} ({pct_c:.1f}%)")
                 if len(sorted_countries) > 15:
                     others = sum(v for _, v in sorted_countries[15:])
-                    lines.append(f"  Other : {others} ({others/total_countries*100:.1f}%)")
-                lines.append(f"━━━━━━━━━━━━━━━━━━━━")
+                    lines_list.append(f"  Other {others} ({others/total_countries*100:.1f}%)")
+                lines_list.append(f"{sep}")
 
-            return "\n".join(lines)
-
+            return "\n".join(lines_list)
     def save_progress(self, filepath="progress_resume.json"):
         """Save current progress state to file for resume capability."""
         with self.lock:
@@ -4649,23 +4662,35 @@ def _handle_file(token: str, chat_id, message: dict, from_user: dict = None):
                 )
             else:
                 valid      = stats.get("valid", 0)
+                valid      = stats.get("valid", 0)
                 invalid    = stats.get("invalid", 0)
                 clean_c    = stats.get("clean", 0)
                 not_clean  = stats.get("not_clean", 0)
                 has_codm   = stats.get("has_codm", 0)
+                no_codm    = stats.get("no_codm", 0)
                 total_done = stats.get("total", 0)
+                hit_rate   = f"{(valid/total_done*100):.1f}%" if total_done > 0 else "0.0%"
+                elapsed_s  = stats.get("elapsed", 0)
+                elapsed_str = _fmt_time(elapsed_s) if elapsed_s > 0 else "0s"
+                speed_val  = stats.get("speed", 0)
+                speed_str  = f"{speed_val:.1f}/s" if speed_val > 0 else "0.0/s"
 
                 _tg_send(token, chat_id,
-                    f"✅ <b>Checker Finished!</b>\n\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📊 <b>Final Results for</b> <code>{file_name}</code>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"✅ <b>Valid:</b>      <code>{valid}</code>\n"
-                    f"❌ <b>Invalid:</b>    <code>{invalid}</code>\n"
-                    f"🧹 <b>Clean:</b>     <code>{clean_c}</code>\n"
-                    f"⚠️ <b>Not Clean:</b> <code>{not_clean}</code>\n"
-                    f"🎮 <b>Has CODM:</b>  <code>{has_codm}</code>\n"
-                    f"📦 <b>Total:</b>     <code>{total_done}</code>"
+                    f"\u2705 <b>Check Complete!</b>\n\n"
+                    f"\u2501" * 28 + "\n"
+                    f"\U0001f4ca <b>Results for</b> <code>{file_name}</code>\n"
+                    f"\u2501" * 28 + "\n\n"
+                    f"\u2705 <b>Valid:</b>      <code>{valid}</code>\n"
+                    f"\u274c <b>Invalid:</b>    <code>{invalid}</code>\n"
+                    f"\U0001f9f9 <b>Clean:</b>     <code>{clean_c}</code>\n"
+                    f"\u26a0\ufe0f <b>Not Clean:</b> <code>{not_clean}</code>\n"
+                    f"\U0001f3ae <b>Has CODM:</b>  <code>{has_codm}</code>\n"
+                    f"\U0001f534 <b>No CODM:</b>   <code>{no_codm}</code>\n"
+                    f"\U0001f4e6 <b>Total:</b>     <code>{total_done}</code>\n\n"
+                    f"\u2501" * 28 + "\n"
+                    f"\U0001f3af <b>Hit Rate:</b> <code>{hit_rate}</code>\n"
+                    f"\u23f1 <b>Elapsed:</b>   <code>{elapsed_str}</code>\n"
+                    f"\u26a1 <b>Speed:</b>     <code>{speed_str}</code>"
                 )
 
             # ── Send zip FIRST, then delete everything ─────────
@@ -5164,10 +5189,10 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
                 if _progress_msg_id[0]:
                     _tg_api(tg_token, "editMessageText",
                             chat_id=tg_chat, message_id=_progress_msg_id[0],
-                            text=fancy)
+                            parse_mode="HTML", text=fancy)
                 else:
                     resp = _tg_api(tg_token, "sendMessage",
-                                   chat_id=tg_chat, text=fancy)
+                                   parse_mode="HTML", chat_id=tg_chat, text=fancy)
                     if resp and resp.get("ok"):
                         _progress_msg_id[0] = resp["result"]["message_id"]
             except Exception:
@@ -5432,10 +5457,10 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
                 if _progress_msg_id[0]:
                     _tg_api(tg_token, "editMessageText",
                             chat_id=chat_id, message_id=_progress_msg_id[0],
-                            text=final_text)
+                            parse_mode="HTML", text=final_text)
                 else:
                     _tg_api(tg_token, "sendMessage",
-                            chat_id=chat_id, text=final_text)
+                            parse_mode="HTML", chat_id=chat_id, text=final_text)
     except Exception:
         pass
 
