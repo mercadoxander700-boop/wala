@@ -1340,6 +1340,7 @@ class LiveStats:
         self.current_speed = 0.0  # accounts per second
         self.eta_seconds = None
         self.total_accounts = 0
+        self.already_done = 0  # accounts processed in previous sessions (for resume)
         # Level distribution tracking
         self.level_distribution = {
             "1-50": 0, "51-100": 0, "101-150": 0, "151-200": 0,
@@ -1350,13 +1351,17 @@ class LiveStats:
         # Country distribution tracking
         self.country_distribution = {}
 
-    def start_tracking(self, total_accounts):
-        """Initialize progress tracking with total account count."""
+    def start_tracking(self, total_accounts, already_done=0):
+        """Initialize progress tracking with total account count.
+        total_accounts = original total (e.g. 100), not remaining.
+        already_done = accounts processed before this session (e.g. 50).
+        """
         with self.lock:
             self.start_time = time.time()
             self.last_update_time = self.start_time
             self.last_processed_count = 0
             self.total_accounts = total_accounts
+            self.already_done = already_done
             self.current_speed = 0.0
             self.eta_seconds = None
 
@@ -1433,7 +1438,9 @@ class LiveStats:
                 'not_clean': self.not_clean_count,
                 'has_codm': self.has_codm_count,
                 'no_codm': self.no_codm_count,
-                'total': self.total_processed,
+                'total': self.already_done + self.total_processed,
+                'total_this_session': self.total_processed,
+                'already_done': self.already_done,
                 'speed': round(self.current_speed, 2),
                 'eta': self.eta_seconds,
                 'total_accounts': self.total_accounts,
@@ -1448,7 +1455,8 @@ class LiveStats:
         with self.lock:
             if self.total_accounts <= 0:
                 return ""
-            pct = self.total_processed / self.total_accounts
+            display_processed = self.already_done + self.total_processed
+            pct = display_processed / self.total_accounts
             filled = int(width * pct)
             bar = "█" * filled + "░" * (width - filled)
             return f"[{bar}] {pct * 100:.1f}%"
@@ -1488,7 +1496,8 @@ class LiveStats:
         # Build progress section
         progress_section = ""
         if stats['total_accounts'] > 0:
-            pct = stats['total'] / stats['total_accounts']
+            display_total_proc = stats.get('already_done', 0) + stats['total']
+            pct = display_total_proc / stats['total_accounts']
             filled = int(30 * pct)
             bar = "█" * filled + "░" * (30 - filled)
             speed_str = f"{stats['speed']:.1f}/s" if stats['speed'] > 0 else "calculating..."
@@ -1530,14 +1539,15 @@ class LiveStats:
         with self.lock:
             if self.total_accounts <= 0:
                 return None
-            pct = self.total_processed / self.total_accounts
+            display_processed = self.already_done + self.total_processed
+            pct = display_processed / self.total_accounts if self.total_accounts > 0 else 0
             speed_str = f"{self.current_speed:.1f}/s" if self.current_speed > 0 else "calculating..."
             eta_str = self.format_time(self.eta_seconds) if self.eta_seconds else "N/A"
             elapsed_str = self.format_time(time.time() - self.start_time) if self.start_time else "0s"
             success_rate = (self.valid_count / self.total_processed * 100) if self.total_processed > 0 else 0
-            remaining = self.total_accounts - self.total_processed
+            remaining = self.total_accounts - display_processed
             return (
-                f"📊 *Progress:* {pct*100:.1f}% ({self.total_processed}/{self.total_accounts})\n"
+                f"📊 *Progress:* {pct*100:.1f}% ({display_processed}/{self.total_accounts})\n"
                 f"⏱ *Speed:* {speed_str} | *ETA:* {eta_str}\n"
                 f"🕐 *Elapsed:* {elapsed_str}\n"
                 f"✅ *Valid:* {self.valid_count} | ❌ *Invalid:* {self.invalid_count}\n"
@@ -1550,14 +1560,16 @@ class LiveStats:
             if self.total_accounts <= 0:
                 return None
 
-            pct = self.total_processed / self.total_accounts
+            # For resume: show already_done + current progress vs original total
+            display_processed = self.already_done + self.total_processed
+            pct = display_processed / self.total_accounts if self.total_accounts > 0 else 0
             pct_int = int(pct * 100)
-            bar = self._make_bar(self.total_processed, self.total_accounts, 10)
+            bar = self._make_bar(display_processed, self.total_accounts, 10)
 
             lines = [
                 f"⚡️ Checking…",
                 f"━━━━━━━━━━━━━━━━━━━━",
-                f"⏳ [{bar}] {pct_int}%  {self.total_processed:,}/{self.total_accounts:,}",
+                f"⏳ [{bar}] {pct_int}%  {display_processed:,}/{self.total_accounts:,}",
                 f"━━━━━━━━━━━━━━━━━━━━",
                 f"✅ Valid      : {self.valid_count:,}",
                 f"❌ Invalid    : {self.invalid_count:,}",
@@ -3972,14 +3984,16 @@ _active_sessions_lock = threading.Lock()
 
 
 def _save_active_session(chat_id, file_path: str, file_name: str, lines: list,
-                         user_data: dict, progress: int = 0):
+                         user_data: dict, progress: int = 0,
+                         original_total: int = 0, already_done: int = 0):
     """Persist an active checking session to disk for crash recovery.
     Also saves a copy of the combo file to saved_combos/ so it survives restarts.
     
     The 'lines' parameter should contain the REMAINING lines to check.
-    'progress' is the number of lines already processed from the original file.
-    On resume, the bot reads the persistent combo file and skips 'progress' lines
-    to continue from where it left off.
+    'progress' is the number of lines already processed in THIS run (since last trim).
+    'original_total' is the total from the VERY FIRST run (e.g. 100 for a 100-line file).
+    'already_done' is the total processed across ALL runs (before this session started).
+    On resume, original_total and already_done allow showing "50/100" instead of "0/50".
     """
     # ── Save combo file to persistent directory ──
     os.makedirs(SAVED_COMBOS_DIR, exist_ok=True)
@@ -3999,6 +4013,8 @@ def _save_active_session(chat_id, file_path: str, file_name: str, lines: list,
             "file_name": file_name,
             "total_lines": len(lines),
             "progress": progress,
+            "original_total": original_total or len(lines),
+            "already_done": already_done,
             "level": user_data.get("level", [1]),
             "clean_filter": user_data.get("clean_filter", "both"),
             "hits_id": user_data.get("hits_id", chat_id),
@@ -4032,8 +4048,12 @@ def _update_session_progress(chat_id, progress: int):
                         with open(persistent_path, "w", encoding="utf-8") as fh:
                             fh.write("\n".join(remaining) + "\n")
                         # Update total_lines to reflect remaining
+                        old_progress = _active_sessions[key].get("progress", 0)
+                        old_already_done = _active_sessions[key].get("already_done", 0)
                         _active_sessions[key]["total_lines"] = len(remaining)
                         _active_sessions[key]["progress"] = 0  # reset since file is now trimmed
+                        # Accumulate already_done: previous already_done + progress just made
+                        _active_sessions[key]["already_done"] = old_already_done + old_progress
                         _flush_active_sessions()
                 except Exception as e:
                     logger.debug(f"[BOT] Could not trim persistent combo for {chat_id}: {e}")
@@ -4464,7 +4484,8 @@ def _handle_file(token: str, chat_id, message: dict, from_user: dict = None):
     # ── If no proxies: save combo and register as proxy-paused ──
     _is_owner_user = _is_owner(from_user) if from_user else False
     if not _has_proxies() and not _is_owner_user:
-        _register_proxy_paused(chat_id, clean_path, file_name, clean_lines, d)
+        _register_proxy_paused(chat_id, clean_path, file_name, clean_lines, d,
+                               original_total=len(clean_lines), already_done=0)
         with _state_lock:
             _bot_state[chat_id] = "AWAIT_FILE"
         _tg_send(token, chat_id,
@@ -4487,7 +4508,8 @@ def _handle_file(token: str, chat_id, message: dict, from_user: dict = None):
         _bot_state[chat_id] = "RUNNING"
 
     # ── Save active session for auto-resume on crash ───────────
-    _save_active_session(chat_id, clean_path, file_name, clean_lines, d)
+    _save_active_session(chat_id, clean_path, file_name, clean_lines, d,
+                         original_total=len(clean_lines), already_done=0)
 
     # ── Create a per-user stop event ───────────────────────────
     stop_evt = threading.Event()
@@ -5022,7 +5044,7 @@ def _get_user_tier(chat_id) -> str:
     return cached_tier or "free"
 
 
-def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, label: str = "user", stop_event=None) -> tuple:
+def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, label: str = "user", stop_event=None, original_total: int = 0, already_done: int = 0) -> tuple:
     """Returns (stats_dict, result_folder_path)"""
     if not os.path.exists(filepath):
         logger.error(f"[BOT] File not found: {filepath}")
@@ -5049,6 +5071,12 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
         return {}, result_folder
 
     total            = len(accounts)
+    # ── Resume-aware progress: use original_total for display ──
+    # original_total = total from the VERY FIRST run (e.g. 100)
+    # already_done = accounts processed before this session (e.g. 50)
+    # total = remaining accounts in this run (e.g. 50)
+    # Display should show: (already_done + processed_so_far) / original_total
+    display_total = original_total if original_total > 0 else total
     # ── Determine user tier: VIP = no queue, Free = queued ──
     is_owner = (chat_id == OWNER_ID or chat_id in COOWNER_IDS) if chat_id else False
     is_vip = _is_vip_user(chat_id) if chat_id else False
@@ -5072,7 +5100,7 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
     logger.info(f"[CHECKER] {label} → VIP:{vip_threads} Free:{free_threads} threads ({tier_label})")
     cookie_manager   = CookieManager()
     live_stats       = LiveStats()
-    live_stats.start_tracking(total)
+    live_stats.start_tracking(display_total, already_done=already_done)
     print_lock       = threading.Lock()
     thread_local     = threading.local()
     thread_init_lock = threading.Lock()
@@ -5085,11 +5113,12 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
     with _bars_lock:
         _active_bars[bar_key] = {
             "label": label,
-            "done":  0,
-            "total": total,
+            "done":  already_done,
+            "total": display_total,
             "speed": 0,
             "start_time": start_t,
             "live_stats": live_stats,
+            "already_done": already_done,
         }
 
     done_count = [0]
@@ -5173,7 +5202,8 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
                 done_count[0] += 1
                 elapsed = max(time.time() - start_t, 0.001)
                 speed   = int(done_count[0] / elapsed)
-                _active_bars[bar_key]["done"]  = done_count[0]
+                # For display: show already_done + current progress vs original_total
+                _active_bars[bar_key]["done"]  = already_done + done_count[0]
                 _active_bars[bar_key]["speed"] = speed
         # Persist progress every 10 accounts for crash recovery
         if chat_id and done_count[0] % 10 == 0:
@@ -5414,11 +5444,12 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
     RESET = "\033[0m"
     import sys
     bar_key_str = str(chat_id) if chat_id else label
+    done_display = already_done + done_count[0]
     sys.stdout.write(
         f"\033[2K  {CYAN}id:{bar_key_str}{RESET} "
         f"[{GREEN}{'█' * 30}{RESET}] "
         f"{GREEN}100.0%{RESET}  "
-        f"{WHITE}{total}/{total}{RESET}  "
+        f"{WHITE}{done_display}/{display_total}{RESET}  "
         f"{DIM}done ✓{RESET}\n"
     )
     sys.stdout.flush()
@@ -5513,7 +5544,7 @@ _proxy_paused_users: dict = {}   # chat_id -> {combo_path, file_name, lines, use
 _proxy_paused_lock = threading.Lock()
 
 
-def _register_proxy_paused(chat_id, combo_path: str, file_name: str, lines: list, user_data: dict):
+def _register_proxy_paused(chat_id, combo_path: str, file_name: str, lines: list, user_data: dict, original_total: int = 0, already_done: int = 0):
     """Register a user whose check is paused because no proxies are available.
     Their combo file and progress will be saved so it can auto-resume later.
     
@@ -5562,6 +5593,8 @@ def _register_proxy_paused(chat_id, combo_path: str, file_name: str, lines: list
             "file_name": file_name,
             "total_lines": len(remaining_lines),
             "progress": 0,  # Reset to 0 because we already trimmed the file
+            "original_total": original_total if original_total > 0 else len(lines),
+            "already_done": already_done + existing_progress if already_done > 0 else existing_progress,
             "level": user_data.get("level", [1]),
             "clean_filter": user_data.get("clean_filter", "both"),
             "hits_id": user_data.get("hits_id", chat_id),
@@ -5641,6 +5674,8 @@ def _resume_proxy_paused_users(token: str):
         remaining_lines = all_lines
         progress = sess.get("progress", 0)
         total = sess.get("total_lines", len(remaining_lines))
+        proxy_original_total = sess.get("original_total", progress + len(remaining_lines))
+        proxy_already_done = sess.get("already_done", progress)
 
         if not remaining_lines:
             _tg_send(token, chat_id,
@@ -5671,10 +5706,16 @@ def _resume_proxy_paused_users(token: str):
             fh.write("\n".join(remaining_lines) + "\n")
 
         # Notify user
+        # Calculate original_total for proper progress display
+        proxy_original_total = progress + len(remaining_lines) if progress > 0 else len(remaining_lines)
+        proxy_already_done = progress
+
         _tg_send(token, chat_id,
             f"✅ <b>Proxies are back — Auto-Resuming!</b>\n\n"
             f"📄 <b>File:</b> <code>{file_name}</code>\n"
-            f"📊 <b>Already done:</b> {progress} | <b>Remaining:</b> {len(remaining_lines)} accounts\n\n"
+            f"📊 <b>Progress:</b> {progress}/{proxy_original_total} "
+            f"({progress * 100 // max(proxy_original_total, 1)}% done)\n"
+            f"⏳ <b>Remaining:</b> {len(remaining_lines)} accounts\n\n"
             f"<i>Resuming now... Send /stop to cancel.</i>")
 
         # Start checker thread
@@ -5684,19 +5725,22 @@ def _resume_proxy_paused_users(token: str):
         with _state_lock:
             _bot_state[chat_id] = "RUNNING"
 
-        # Save session for crash recovery
-        _save_active_session(chat_id, resume_path, file_name, remaining_lines, d, 0)
+        # Save session for crash recovery (with original_total for proper progress)
+        _save_active_session(chat_id, resume_path, file_name, remaining_lines, d, 0,
+                             original_total=proxy_original_total, already_done=proxy_already_done)
 
         stop_evt = threading.Event()
         with _stop_events_lock:
             _stop_events[chat_id] = stop_evt
 
         def _paused_resume_run(cid=chat_id, rpath=resume_path, tg_cfg=user_telegram_config,
-                        se=stop_evt, fn=file_name, rem=len(remaining_lines), cp=combo_path):
+                        se=stop_evt, fn=file_name, rem=len(remaining_lines), cp=combo_path,
+                        ot=proxy_original_total, ad=proxy_already_done):
             try:
                 label = f"proxy-resume:{cid}"
                 stats, result_folder = _run_checker_for_file(
-                    rpath, tg_cfg, chat_id=cid, label=label, stop_event=se
+                    rpath, tg_cfg, chat_id=cid, label=label, stop_event=se,
+                    original_total=ot, already_done=ad
                 )
                 stopped = se.is_set()
             except Exception as e:
@@ -5716,14 +5760,42 @@ def _resume_proxy_paused_users(token: str):
                         f"🛑 <b>Resumed checker stopped.</b>\n"
                         f"📊 Partial results for <code>{fn}</code>")
                 else:
-                    valid = stats.get("valid", 0)
-                    invalid = stats.get("invalid", 0)
-                    clean_c = stats.get("clean", 0)
+                    valid      = stats.get("valid", 0)
+                    invalid    = stats.get("invalid", 0)
+                    clean_c    = stats.get("clean", 0)
+                    not_clean  = stats.get("not_clean", 0)
+                    has_codm   = stats.get("has_codm", 0)
+                    total_done = stats.get("total", 0)
+                    total_this = stats.get("total_this_session", 0)
+                    already_d  = stats.get("already_done", 0)
+                    speed      = stats.get("speed", 0)
+                    elapsed    = stats.get("elapsed", 0)
+
+                    # Format elapsed time
+                    el_h = int(elapsed) // 3600
+                    el_m = (int(elapsed) % 3600) // 60
+                    el_s = int(elapsed) % 60
+                    elapsed_str = f"{el_h}h {el_m}m {el_s}s" if el_h > 0 else f"{el_m}m {el_s}s" if el_m > 0 else f"{el_s}s"
+
+                    # Success rate
+                    success_rate = (valid / max(total_done, 1)) * 100
+
                     _tg_send(token, cid,
                         f"✅ <b>Resumed Check Complete!</b>\n\n"
-                        f"📄 <code>{fn}</code>\n"
-                        f"✅ Valid: <code>{valid}</code>  ❌ Invalid: <code>{invalid}</code>  "
-                        f"🧹 Clean: <code>{clean_c}</code>")
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📄 <b>File:</b> <code>{fn}</code>\n"
+                        f"📊 <b>Resumed from:</b> {already_d} | <b>Checked this run:</b> {total_this}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"✅ <b>Valid:</b>      <code>{valid}</code>\n"
+                        f"❌ <b>Invalid:</b>    <code>{invalid}</code>\n"
+                        f"🧹 <b>Clean:</b>     <code>{clean_c}</code>\n"
+                        f"⚠️ <b>Not Clean:</b> <code>{not_clean}</code>\n"
+                        f"🎮 <b>Has CODM:</b>  <code>{has_codm}</code>\n"
+                        f"📦 <b>Total:</b>     <code>{total_done}</code>\n\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📈 <b>Hit Rate:</b> {success_rate:.1f}%  |  ⏱ <b>Time:</b> {elapsed_str}\n"
+                        f"🚀 <b>Speed:</b> {speed:.1f}/s\n"
+                        f"━━━━━━━━━━━━━━━━━━━━")
 
                 if result_folder and os.path.isdir(result_folder):
                     _send_results_zip(token, cid, result_folder, fn)
@@ -9693,8 +9765,15 @@ def _auto_resume_sessions(token: str):
             _remove_active_session(chat_id)
             continue
 
-        # Calculate original total for display (progress already done + remaining)
-        original_total = progress + len(remaining_lines)
+        # Get original total and already_done from session data
+        # original_total = the very first total (e.g. 100 lines)
+        # already_done = total processed across all previous runs (e.g. 50)
+        saved_original_total = sess.get("original_total", 0)
+        saved_already_done = sess.get("already_done", 0)
+        # Calculate effective values if not stored (backward compat)
+        if not saved_original_total:
+            saved_original_total = progress + len(remaining_lines)
+        already_done = saved_already_done + progress  # progress from this run + all previous
 
         # Restore user data
         d = _udata(chat_id)
@@ -9715,10 +9794,14 @@ def _auto_resume_sessions(token: str):
         _last_notify = _resume_notify_ts.get(str(chat_id), 0)
         if time.time() - _last_notify > 300:
             _tg_send(token, chat_id,
-                f"🔄 <b>Auto-Resuming!</b>\n\n"
-                f"Bot restarted — resuming your check automatically.\n\n"
+                f"🔄 <b>Auto-Resume!</b>\n\n"
+                f"Bot restarted — resuming your check from where it left off.\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"📄 <b>File:</b> <code>{file_name}</code>\n"
-                f"📊 <b>Already done:</b> {progress} | <b>Remaining:</b> {len(remaining_lines)} accounts\n\n"
+                f"📊 <b>Progress:</b> {already_done}/{saved_original_total} "
+                f"({already_done * 100 // max(saved_original_total, 1)}% done)\n"
+                f"⏳ <b>Remaining:</b> {len(remaining_lines)} accounts\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"<i>Resuming now... Send /stop to cancel.</i>")
             _resume_notify_ts[str(chat_id)] = time.time()
 
@@ -9730,18 +9813,22 @@ def _auto_resume_sessions(token: str):
             _bot_state[chat_id] = "RUNNING"
 
         # Update session with new file path (also re-saves to persistent dir)
-        _save_active_session(chat_id, resume_path, file_name, remaining_lines, d, 0)
+        # Pass original_total and already_done so progress shows correctly (e.g. 50/100)
+        _save_active_session(chat_id, resume_path, file_name, remaining_lines, d, 0,
+                             original_total=saved_original_total, already_done=already_done)
 
         stop_evt = threading.Event()
         with _stop_events_lock:
             _stop_events[chat_id] = stop_evt
 
         def _resume_run(cid=chat_id, rpath=resume_path, tg_cfg=user_telegram_config,
-                        se=stop_evt, fn=file_name, rem=len(remaining_lines)):
+                        se=stop_evt, fn=file_name, rem=len(remaining_lines),
+                        ot=saved_original_total, ad=already_done):
             try:
                 label = f"resume:{cid}"
                 stats, result_folder = _run_checker_for_file(
-                    rpath, tg_cfg, chat_id=cid, label=label, stop_event=se
+                    rpath, tg_cfg, chat_id=cid, label=label, stop_event=se,
+                    original_total=ot, already_done=ad
                 )
                 stopped = se.is_set()
             except Exception as e:
@@ -9761,14 +9848,42 @@ def _auto_resume_sessions(token: str):
                         f"🛑 <b>Resumed checker stopped.</b>\n"
                         f"📊 Partial results for <code>{fn}</code>")
                 else:
-                    valid = stats.get("valid", 0)
-                    invalid = stats.get("invalid", 0)
-                    clean_c = stats.get("clean", 0)
+                    valid      = stats.get("valid", 0)
+                    invalid    = stats.get("invalid", 0)
+                    clean_c    = stats.get("clean", 0)
+                    not_clean  = stats.get("not_clean", 0)
+                    has_codm   = stats.get("has_codm", 0)
+                    total_done = stats.get("total", 0)
+                    total_this = stats.get("total_this_session", 0)
+                    already_d  = stats.get("already_done", 0)
+                    speed      = stats.get("speed", 0)
+                    elapsed    = stats.get("elapsed", 0)
+
+                    # Format elapsed time
+                    el_h = int(elapsed) // 3600
+                    el_m = (int(elapsed) % 3600) // 60
+                    el_s = int(elapsed) % 60
+                    elapsed_str = f"{el_h}h {el_m}m {el_s}s" if el_h > 0 else f"{el_m}m {el_s}s" if el_m > 0 else f"{el_s}s"
+
+                    # Success rate
+                    success_rate = (valid / max(total_done, 1)) * 100
+
                     _tg_send(token, cid,
                         f"✅ <b>Resumed Check Complete!</b>\n\n"
-                        f"📄 <code>{fn}</code>\n"
-                        f"✅ Valid: <code>{valid}</code>  ❌ Invalid: <code>{invalid}</code>  "
-                        f"🧹 Clean: <code>{clean_c}</code>")
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📄 <b>File:</b> <code>{fn}</code>\n"
+                        f"📊 <b>Resumed from:</b> {already_d} | <b>Checked this run:</b> {total_this}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"✅ <b>Valid:</b>      <code>{valid}</code>\n"
+                        f"❌ <b>Invalid:</b>    <code>{invalid}</code>\n"
+                        f"🧹 <b>Clean:</b>     <code>{clean_c}</code>\n"
+                        f"⚠️ <b>Not Clean:</b> <code>{not_clean}</code>\n"
+                        f"🎮 <b>Has CODM:</b>  <code>{has_codm}</code>\n"
+                        f"📦 <b>Total:</b>     <code>{total_done}</code>\n\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📈 <b>Hit Rate:</b> {success_rate:.1f}%  |  ⏱ <b>Time:</b> {elapsed_str}\n"
+                        f"🚀 <b>Speed:</b> {speed:.1f}/s\n"
+                        f"━━━━━━━━━━━━━━━━━━━━")
 
                 if result_folder and os.path.isdir(result_folder):
                     _send_results_zip(token, cid, result_folder, fn)
