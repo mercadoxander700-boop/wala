@@ -13,7 +13,7 @@ jobs:
       - name: Keep codespace alive
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.CODESPACE_PAT }}
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
