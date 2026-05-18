@@ -884,6 +884,9 @@ RAW_PROXY_SOURCES = [
 RAW_PROXY_FETCH_INTERVAL = 30  # 30 seconds — faster refresh for better proxy availability
 RAW_PROXY_SAVE_FILE = os.path.join(PROXY_FOLDER, "raw_fetched_proxies.txt")
 
+# ── Auto-fetch toggle (controllable via /autofetch command) ──
+_auto_fetch_enabled = True
+
 
 
 
@@ -941,6 +944,12 @@ def _fetch_raw_proxies():
         # Touch liveness at the start of every fetch cycle so the watchdog
         # knows the proxy fetcher thread is alive even if no new proxies found
         _touch_liveness()
+
+        # Skip fetch cycle if auto-fetch is disabled via /autofetch command
+        if not _auto_fetch_enabled:
+            shutdown_event.wait(RAW_PROXY_FETCH_INTERVAL)
+            continue
+
         try:
             total_new = 0
             total_fetched = 0
@@ -1158,10 +1167,11 @@ logger = logging.getLogger()
 handler = logging.StreamHandler()
 handler.setFormatter(ColoredFormatter())
 logger.addHandler(handler)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 logging.getLogger("urllib3").setLevel(logging.ERROR)
-logging.getLogger("requests").setLevel(logging.ERROR)   
+logging.getLogger("requests").setLevel(logging.ERROR)
+logging.getLogger("cloudscraper").setLevel(logging.ERROR)
 
 class GracefulThreadPoolExecutor(ThreadPoolExecutor):
     def __init__(self, *args, **kwargs):
@@ -1819,9 +1829,9 @@ def get_datadome_cookie(session, max_retries=3):
                 return datadome
             else:
                 _status = response_json.get('status', 'unknown')
-                logger.warning(f"[DATADOME] Attempt {attempt}/{max_retries}: API returned status {_status} (no cookie)")
+                logger.debug(f"[DATADOME] Attempt {attempt}/{max_retries}: API returned status {_status} (no cookie)")
         except requests.exceptions.RequestException as e:
-            logger.warning(f"[DATADOME] Attempt {attempt}/{max_retries}: Request failed — {e}")
+            logger.debug(f"[DATADOME] Attempt {attempt}/{max_retries}: Request failed — {e}")
         
         # Rotate proxy for next attempt (if not the last try)
         if attempt < max_retries:
@@ -1832,7 +1842,7 @@ def get_datadome_cookie(session, max_retries=3):
                 pass
             time.sleep(0.3 * attempt)  # small backoff
 
-    logger.error(f"[DATADOME] Failed to get DataDome cookie after {max_retries} attempts")
+    logger.warning(f"[DATADOME] Failed to get DataDome cookie after {max_retries} attempts")
     return None
     
 def prelogin(session, account, datadome_manager, telegram_config=None):
@@ -2670,7 +2680,7 @@ def processaccount(session, account, password, cookie_manager, datadome_manager,
             v1, v2, new_datadome = prelogin(session, account, datadome_manager, telegram_config=telegram_config)
 
             if v1 == "IP_BLOCKED":
-                logger.warning(f"[RETRY] IP blocked attempt {ip_block_attempt + 1}/{MAX_IP_BLOCK_RETRIES} — rotating proxy + refreshing DataDome...")
+                logger.debug(f"[RETRY] IP blocked attempt {ip_block_attempt + 1}/{MAX_IP_BLOCK_RETRIES} — rotating proxy + refreshing DataDome...")
                 # Try force-rotate first
                 new_proxy = geo_rotator.force_rotate()
                 if new_proxy:
@@ -2678,18 +2688,18 @@ def processaccount(session, account, password, cookie_manager, datadome_manager,
                     # Refresh DataDome on new proxy
                     datadome_manager.refresh_datadome(session)
                 else:
-                    logger.warning(f"[RETRY] No proxy available for rotation — trying direct connection")
+                    logger.debug(f"[RETRY] No proxy available for rotation — trying direct connection")
                     session.proxies.clear()
                     datadome_manager.refresh_datadome(session)
                 continue
 
             if v1 == "CONN_ERROR":
-                logger.warning(f"[RETRY] Connection error attempt {ip_block_attempt + 1}/{MAX_IP_BLOCK_RETRIES} — smart rotating...")
+                logger.debug(f"[RETRY] Connection error attempt {ip_block_attempt + 1}/{MAX_IP_BLOCK_RETRIES} — smart rotating...")
                 new_proxy = geo_rotator.smart_rotate()
                 if new_proxy:
                     session.proxies.update(geo_rotator.get_proxies())
                 else:
-                    logger.warning(f"[RETRY] No proxy available — trying direct connection")
+                    logger.debug(f"[RETRY] No proxy available — trying direct connection")
                     session.proxies.clear()
                 continue
 
@@ -3817,6 +3827,10 @@ def _tg_set_commands(token: str):
         {"command": "remove_coowner", "description": "👥 Remove a co-owner"},
         {"command": "stopall",        "description": "☢️ Stop ALL running checkers"},
         {"command": "broadcast",      "description": "📢 Send message to all users"},
+        {"command": "autofetch",      "description": "🔄 Toggle proxy auto-fetch on/off"},
+        {"command": "addfetchurl",    "description": "➕ Add a proxy fetch URL"},
+        {"command": "removefetchurl", "description": "➖ Remove a proxy fetch URL"},
+        {"command": "fetchurls",      "description": "📋 List proxy fetch URLs"},
         {"command": "resetconfig",    "description": "🔧 Re-run bot setup wizard"},
         {"command": "start",          "description": "▶️ Start / restore session"},
         {"command": "reset",          "description": "🔄 Clear settings"},
@@ -8526,6 +8540,123 @@ def _handle_renew_proxy(token: str, chat_id, from_user: dict):
             f"📡 Proxy pool now: <code>{pool_now}</code>")
 
 
+def _handle_autofetch(token: str, chat_id, from_user: dict, args: str = ""):
+    """Toggle proxy auto-fetch on/off via /autofetch [on|off]."""
+    global _auto_fetch_enabled
+    arg = args.strip().lower()
+    if arg == "on":
+        _auto_fetch_enabled = True
+    elif arg == "off":
+        _auto_fetch_enabled = False
+    else:
+        _auto_fetch_enabled = not _auto_fetch_enabled
+
+    status = "ON" if _auto_fetch_enabled else "OFF"
+    emoji = "✅" if _auto_fetch_enabled else "⏸"
+    _tg_send(token, chat_id,
+        f"{emoji} <b>Auto-fetch is now {status}</b>\n\n"
+        f"Proxy auto-fetch interval: <code>{RAW_PROXY_FETCH_INTERVAL}s</code>\n"
+        f"Sources: <code>{len(RAW_PROXY_SOURCES)}</code>\n\n"
+        f"<i>Use /autofetch on|off to change.</i>")
+
+
+def _handle_addfetchurl(token: str, chat_id, from_user: dict, args: str = ""):
+    """Add a proxy fetch URL via /addfetchurl <url> [scheme]."""
+    parts = args.strip().split()
+    if not parts:
+        _tg_send(token, chat_id,
+            "❌ <b>Usage:</b> <code>/addfetchurl &lt;url&gt; [scheme]</code>\n\n"
+            "Examples:\n"
+            "<code>/addfetchurl https://example.com/proxies.txt</code>\n"
+            "<code>/addfetchurl https://example.com/socks.txt socks5</code>\n\n"
+            "Default scheme: <code>http</code>")
+        return
+
+    url = parts[0]
+    scheme = parts[1] if len(parts) > 1 else "http"
+    if scheme.lower() in ("socks5", "socks5h"):
+        scheme = "socks5h"
+
+    for entry in RAW_PROXY_SOURCES:
+        existing_url = entry[0] if isinstance(entry, tuple) else entry
+        if existing_url == url:
+            _tg_send(token, chat_id, f"⚠️ URL already exists in fetch sources:\n<code>{url}</code>")
+            return
+
+    RAW_PROXY_SOURCES.append((url, scheme))
+    _tg_send(token, chat_id,
+        f"✅ <b>Fetch URL added!</b>\n\n"
+        f"🔗 <code>{url}</code>\n"
+        f"📋 Scheme: <code>{scheme}</code>\n"
+        f"📡 Total sources: <code>{len(RAW_PROXY_SOURCES)}</code>")
+
+
+def _handle_removefetchurl(token: str, chat_id, from_user: dict, args: str = ""):
+    """Remove a proxy fetch URL via /removefetchurl <url|index>."""
+    arg = args.strip()
+    if not arg:
+        _tg_send(token, chat_id,
+            "❌ <b>Usage:</b> <code>/removefetchurl &lt;url|index&gt;</code>\n\n"
+            "Use /fetchurls to see the list with indexes.")
+        return
+
+    try:
+        idx = int(arg) - 1
+        if 0 <= idx < len(RAW_PROXY_SOURCES):
+            removed = RAW_PROXY_SOURCES.pop(idx)
+            removed_url = removed[0] if isinstance(removed, tuple) else removed
+            _tg_send(token, chat_id,
+                f"✅ <b>Removed fetch URL #{idx + 1}</b>\n\n"
+                f"🔗 <code>{removed_url}</code>\n"
+                f"📡 Remaining sources: <code>{len(RAW_PROXY_SOURCES)}</code>")
+            return
+        else:
+            _tg_send(token, chat_id, f"❌ Index out of range. Use /fetchurls to see valid indexes.")
+            return
+    except ValueError:
+        pass
+
+    for i, entry in enumerate(RAW_PROXY_SOURCES):
+        existing_url = entry[0] if isinstance(entry, tuple) else entry
+        if existing_url == arg:
+            RAW_PROXY_SOURCES.pop(i)
+            _tg_send(token, chat_id,
+                f"✅ <b>Removed fetch URL</b>\n\n"
+                f"🔗 <code>{arg}</code>\n"
+                f"📡 Remaining sources: <code>{len(RAW_PROXY_SOURCES)}</code>")
+            return
+
+    _tg_send(token, chat_id, f"⚠️ URL not found in fetch sources:\n<code>{arg}</code>")
+
+
+def _handle_fetchurls(token: str, chat_id, from_user: dict):
+    """List all proxy fetch URLs via /fetchurls."""
+    status = "ON" if _auto_fetch_enabled else "OFF"
+    if not RAW_PROXY_SOURCES:
+        _tg_send(token, chat_id,
+            f"📋 <b>Proxy Fetch URLs</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Auto-fetch: <b>{status}</b>\n\n"
+            f"<i>No fetch URLs configured.</i>\n\n"
+            f"Use <code>/addfetchurl &lt;url&gt;</code> to add one.")
+        return
+
+    lines = []
+    for i, entry in enumerate(RAW_PROXY_SOURCES, 1):
+        if isinstance(entry, tuple):
+            url, scheme = entry[0], entry[1]
+        else:
+            url, scheme = entry, "http"
+        lines.append(f"  {i}. <code>{url}</code> ({scheme})")
+
+    _tg_send(token, chat_id,
+        f"📋 <b>Proxy Fetch URLs</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Auto-fetch: <b>{status}</b> | Interval: <code>{RAW_PROXY_FETCH_INTERVAL}s</code>\n\n"
+        + "\n".join(lines) + "\n\n"
+        f"<i>/addfetchurl &lt;url&gt; · /removefetchurl &lt;url|#&gt; · /autofetch</i>")
+
+
 def _handle_check(token: str, chat_id, from_user: dict, sub_cmd: str = ""):
     """
     /check         — full overview (level + country + server)
@@ -8595,7 +8726,7 @@ def _handle_check(token: str, chat_id, from_user: dict, sub_cmd: str = ""):
             sections.append("📊 <i>No level data yet.</i>")
 
     # ── Country Distribution ────────────────────────────────
-    if sub in ("", "country"):
+    if sub in ("", "country", "lang", "id"):
         if country_dist:
             sorted_c = sorted(country_dist.items(), key=lambda x: x[1], reverse=True)
             total_c = sum(v for _, v in sorted_c)
@@ -8608,7 +8739,7 @@ def _handle_check(token: str, chat_id, from_user: dict, sub_cmd: str = ""):
                 others = sum(v for _, v in sorted_c[20:])
                 c_lines.append(f"  Other : {others} ({others/total_c*100:.1f}%)")
             sections.append("\n".join(c_lines))
-        elif sub == "country":
+        elif sub in ("country", "lang", "id"):
             sections.append("🌍 <i>No country data yet.</i>")
 
     # ── Server/Region Distribution ──────────────────────────
@@ -8633,7 +8764,7 @@ def _handle_check(token: str, chat_id, from_user: dict, sub_cmd: str = ""):
 
     body += (
         f"\n━━━━━━━━━━━━━━━━━━━━\n"
-        f"<i>💡 /check level · /check country · /check server</i>"
+        f"<i>💡 /check level · /check country · /check server · /check id · /check lang</i>"
     )
 
     _tg_send(token, chat_id, body)
@@ -9769,6 +9900,38 @@ def _handle_bot_update_inner(token: str, update: dict, _unused_config):
             ])
         return
 
+    # ── /autofetch — toggle auto-fetch on/off ────────────────
+    if cmd == "autofetch":
+        if not _is_owner(from_user):
+            _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
+            return
+        _handle_autofetch(token, chat_id, from_user, cmd_args)
+        return
+
+    # ── /addfetchurl — add a proxy fetch URL ──────────────
+    if cmd == "addfetchurl":
+        if not _is_owner(from_user):
+            _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
+            return
+        _handle_addfetchurl(token, chat_id, from_user, cmd_args)
+        return
+
+    # ── /removefetchurl — remove a proxy fetch URL ────────
+    if cmd == "removefetchurl":
+        if not _is_owner(from_user):
+            _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
+            return
+        _handle_removefetchurl(token, chat_id, from_user, cmd_args)
+        return
+
+    # ── /fetchurls — list proxy fetch URLs ────────────────
+    if cmd == "fetchurls":
+        if not _is_owner(from_user):
+            _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
+            return
+        _handle_fetchurls(token, chat_id, from_user)
+        return
+
     if cmd == "statuskey":
         if not _is_owner(from_user):
             _tg_send(token, chat_id, "🚫 <b>Owner only command.</b>")
@@ -10750,15 +10913,15 @@ def main():
             except Exception as e:
                 logger.debug(f"[WATCHDOG] Error: {e}")
 
-            # GC only when memory is elevated (tier > 0) — not every cycle
+            # GC when memory is elevated — more aggressive at higher tiers
             if tier > 0:
                 try:
-                    gc.collect()
+                    gc.collect(generation=2)
                 except Exception:
                     pass
 
-            # Check every 30s
-            time.sleep(30)
+            # Check every 15s for faster response to memory pressure
+            time.sleep(15)
 
 
     # ── Railway keep-alive heartbeat ─────────────────────────
