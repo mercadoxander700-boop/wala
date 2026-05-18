@@ -171,6 +171,9 @@ MAX_THREADS_PER_USER = FREE_THREADS_PER_USER
 
 # Global semaphore — enforces MAX_GLOBAL_THREADS hard cap
 _global_thread_sem = threading.Semaphore(MAX_GLOBAL_THREADS)
+# Memory throttle flag — set by watchdog, checked by workers before acquiring semaphore
+# This replaces unsafe direct semaphore._value manipulation that caused corruption
+_memory_throttle_delay = 0.0  # seconds to sleep before acquiring global sem (0 = no throttle)
 
 # ══════════════════════════════════════════════════════════════
 #  GEO PROXY CONFIG  (auto-reads all .txt files from proxy/ folder, loops)
@@ -3286,8 +3289,8 @@ def create_thread_session(cookie_manager, datadome_manager):
     3. Always attempt to get a fresh DataDome cookie for the session"""
     sess = cloudscraper.create_scraper()
     adapter = requests.adapters.HTTPAdapter(
-        pool_connections=3,
-        pool_maxsize=5,
+        pool_connections=2,
+        pool_maxsize=3,
         max_retries=1,
     )
     sess.mount("http://",  adapter)
@@ -5472,6 +5475,7 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
     # (via the finally block in error paths), corrupting the semaphore count
     # and causing OTHER users' checkers to restart.
     def vip_worker():
+        _vip_gc_counter = 0
         while not pq.should_stop():
             # Step 1: Acquire VIP slot (instant — dedicated VIP pool)
             if not pq.acquire_vip_slot(timeout=0.5):
@@ -5511,6 +5515,10 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
             # Step 4: Acquire global thread slot, then process
             # Only acquire AFTER confirming we have an account and we're not stopping.
             # This prevents semaphore corruption that causes other users to restart.
+            # Memory throttle: sleep before acquire to slow down under high RAM
+            _td = _memory_throttle_delay
+            if _td > 0:
+                time.sleep(_td)
             _global_thread_sem.acquire()
             try:
                 _do_account(account['line'], account['idx'])
@@ -5524,6 +5532,11 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
             pq.mark_vip_done()
             _update_progress()
 
+            # Periodic GC every 50 accounts to prevent memory accumulation
+            _vip_gc_counter += 1
+            if _vip_gc_counter % 50 == 0:
+                gc.collect()
+
     # ── Free Worker: Acquires slot FIRST (BLOCKS if full = QUEUE), then processes ──
     # KEY: Free semaphore is acquired BEFORE pulling from queue.
     # If all free_threads slots are taken, the worker WAITS here — this IS the queue.
@@ -5534,6 +5547,7 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
     # prevents the semaphore count corruption that caused checker restarts
     # when multiple users (VIP + Free) were running simultaneously.
     def free_worker():
+        _free_gc_counter = 0
         while not pq.should_stop():
             # Step 1: Acquire Free slot — THIS IS THE QUEUE
             # If all free_threads slots are busy, worker blocks here until one opens
@@ -5574,6 +5588,10 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
             # Step 4: Acquire global thread slot, then process
             # Only acquire AFTER confirming we have an account and we're not stopping.
             # This prevents semaphore corruption that causes other users to restart.
+            # Memory throttle: sleep before acquire to slow down under high RAM
+            _td = _memory_throttle_delay
+            if _td > 0:
+                time.sleep(_td)
             _global_thread_sem.acquire()
             try:
                 _do_account(account['line'], account['idx'])
@@ -5586,6 +5604,11 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
             pq.release_free_slot()
             pq.mark_free_done()
             _update_progress()
+
+            # Periodic GC every 50 accounts to prevent memory accumulation
+            _free_gc_counter += 1
+            if _free_gc_counter % 50 == 0:
+                gc.collect()
 
     # ── Start workers ──
     workers = []
@@ -10224,11 +10247,34 @@ def _auto_resume_sessions(token: str):
         logger.info(f"[BOT] 🔄 Resumed session for chat_id={chat_id}, {len(remaining_lines)} remaining")
 
 
+# Module-level executor — reused across crash-guard restarts to prevent thread leaks
+_poll_executor = None
+_poll_executor_lock = threading.Lock()
+
+def _get_poll_executor():
+    """Get or create the polling ThreadPoolExecutor. Reuses existing if alive."""
+    global _poll_executor
+    with _poll_executor_lock:
+        if _poll_executor is None or _poll_executor._shutdown:
+            _poll_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="BotUpdate")
+        return _poll_executor
+
+def _shutdown_poll_executor():
+    """Gracefully shutdown the polling executor (called by crash guard before restart)."""
+    global _poll_executor
+    with _poll_executor_lock:
+        if _poll_executor is not None:
+            try:
+                _poll_executor.shutdown(wait=False)
+            except Exception:
+                pass
+            _poll_executor = None
+
 # ── long-poll loop (single daemon thread, handles all users) ───
 def start_bot_polling(token: str, _unused=None):
     offset = 0
     consecutive_errors = 0
-    _update_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="BotUpdate")
+    _update_executor = _get_poll_executor()
 
     def _create_poll_session():
         """Create a fresh polling session with keep-alive."""
@@ -10623,26 +10669,27 @@ def main():
         logger.warning(f"[MAIN] Failed to send restart notification: {e}")
 
     # ── Memory watchdog — 3-tier adaptive throttle ───────────────
-    # Tier 1 (>80%): reduce to 3 threads (warn)
-    # Tier 2 (>87%): reduce to 2 threads (critical)
-    # Tier 3 (>93%): reduce to 1 thread  (emergency — stop new work)
+    # Instead of draining/restoring semaphore slots (which corrupted the
+    # semaphore count and caused cascading restarts), we use a safe
+    # throttle-delay approach: workers sleep before acquiring the global
+    # semaphore, naturally slowing down new work without corrupting state.
+    #
+    # Tier 1 (>85%): 2s delay per acquire (warn)
+    # Tier 2 (>90%): 5s delay per acquire (critical)
+    # Tier 3 (>95%): 10s delay per acquire (emergency — near-pause)
     def _memory_watchdog():
+        global _memory_throttle_delay
         try:
             import psutil
         except ImportError:
             logger.warning("[WATCHDOG] psutil not installed — RAM watchdog disabled. Install with: pip install psutil")
             return
 
-        # Track last tier to avoid log spam
         last_tier = 0
-        _boot_time = time.time()  # ANTI-OVERHEAT: track startup time
+        _boot_time = time.time()
 
         while not shutdown_event.is_set():
             try:
-                # ── ANTI-OVERHEAT: Startup grace period (120s) ─────────
-                # During startup, only OBSERVE — don't drain semaphores.
-                # Startup often has high RAM briefly; draining semaphores
-                # mid-initialization can cause cascading failures and crashes.
                 uptime = time.time() - _boot_time
                 in_grace = uptime < 120
 
@@ -10650,57 +10697,43 @@ def main():
                 pct  = mem.percent
                 free = mem.available // (1024 * 1024)  # MB
 
-                # ── Determine tier ──────────────────────────────────────
-                if pct >= 93:
+                # ── Determine tier (raised thresholds — old 80% was too aggressive) ──
+                if pct >= 95:
                     tier   = 3
-                    target = 1
+                    delay  = 10.0
                     label  = "🚨 EMERGENCY"
-                elif pct >= 87:
+                elif pct >= 90:
                     tier   = 2
-                    target = 2
+                    delay  = 5.0
                     label  = "🔴 CRITICAL"
-                elif pct >= 80:
+                elif pct >= 85:
                     tier   = 1
-                    target = 3
+                    delay  = 2.0
                     label  = "🟡 WARNING"
                 else:
                     tier   = 0
-                    target = MAX_GLOBAL_THREADS
+                    delay  = 0.0
                     label  = "🟢 OK"
 
                 # ── Only act/log on tier change ──────────────────────
                 if tier != last_tier:
                     if tier > 0:
-                        # Force garbage collection on high memory
                         gc.collect()
                         if in_grace:
-                            # ANTI-OVERHEAT: During grace period, just log — don't drain
                             logger.warning(
                                 f"[WATCHDOG] {label} — RAM {pct:.1f}% ({free}MB free) "
                                 f"→ observation only (startup grace {int(uptime)}s/120s)"
                             )
                         else:
+                            _memory_throttle_delay = delay
                             logger.warning(
                                 f"[WATCHDOG] {label} — RAM {pct:.1f}% ({free}MB free) "
-                                f"→ throttling to {target} thread(s)"
+                                f"→ throttle delay {delay}s per thread acquire"
                             )
-                            # Drain excess semaphore slots down to target
-                            drained = 0
-                            while _global_thread_sem._value > target:
-                                if _global_thread_sem.acquire(blocking=False):
-                                    drained += 1
-                                else:
-                                    break
-                            if drained:
-                                logger.warning(f"[WATCHDOG] Drained {drained} slot(s) — semaphore now at {target}")
                     else:
-                        # Recovering — restore semaphore to full
-                        current = _global_thread_sem._value
-                        restore = MAX_GLOBAL_THREADS - current
-                        for _ in range(restore):
-                            _global_thread_sem.release()
-                        if restore:
-                            logger.info(f"[WATCHDOG] 🟢 RAM recovered ({pct:.1f}%) — restored {restore} thread slot(s)")
+                        _memory_throttle_delay = 0.0
+                        if last_tier > 0:
+                            logger.info(f"[WATCHDOG] 🟢 RAM recovered ({pct:.1f}%) — throttle removed")
                     last_tier = tier
 
                 # Tier 3 emergency: notify owner via Telegram
@@ -10709,7 +10742,7 @@ def main():
                         _tg_send(BOT_TOKEN, OWNER_ID,
                             f"🚨 <b>Server RAM Emergency!</b>\n\n"
                             f"RAM at <b>{pct:.1f}%</b> ({free}MB free)\n"
-                            f"Throttled to 1 checker thread.\n"
+                            f"Throttling all new work (10s delay).\n"
                             f"<i>Consider stopping some checkers with /stopall</i>")
                     except Exception:
                         pass
@@ -10718,14 +10751,13 @@ def main():
                 logger.debug(f"[WATCHDOG] Error: {e}")
 
             # GC only when memory is elevated (tier > 0) — not every cycle
-            # Periodic GC every 15s wasted CPU on Railway for no benefit
             if tier > 0:
                 try:
                     gc.collect()
                 except Exception:
                     pass
 
-            # Check every 30s — generous interval to reduce CPU overhead
+            # Check every 30s
             time.sleep(30)
 
 
@@ -10923,6 +10955,8 @@ if __name__ == "__main__":
         try:
             _shutting_down = False  # reset for new attempt
             shutdown_event.clear()   # reset shutdown flag for restart
+            _shutdown_poll_executor()  # kill leaked threads from previous run
+            _memory_throttle_delay = 0.0  # reset throttle for fresh start
             gc.collect()  # clean up before each run
             _last_main_start = time.time()
             main()
