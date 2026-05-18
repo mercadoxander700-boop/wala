@@ -18,6 +18,18 @@ from threading import Lock, Event
 from Crypto.Cipher import AES
 # numpy removed — was unused and caused OOM on Railway (numpy ~50MB RAM)
 import requests
+
+# ── Auto-load .env file if present ──────────────────────────
+# This allows deploying to any hosting that doesn't have a built-in
+# environment variable UI — just upload .env alongside main.py
+try:
+    from dotenv import load_dotenv
+    _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if os.path.exists(_env_path):
+        load_dotenv(_env_path, override=False)  # don't override existing env vars
+        logging.getLogger(__name__).debug(f"[ENV] Loaded .env from {_env_path}")
+except ImportError:
+    pass  # python-dotenv not installed — skip
 import cloudscraper
 import colorama
 import threading
