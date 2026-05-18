@@ -3389,7 +3389,13 @@ CONFIG_FILE = "config.json"
 # the bot can start on Railway (ephemeral FS) without the setup wizard.
 def _is_railway() -> bool:
     """Detect if running on Railway (or similar cloud platform)."""
-    return bool(os.environ.get("RAILWAY_SERVICE_ID") or os.environ.get("RAILWAY_PROJECT_ID") or os.environ.get("RAILWAY_ENVIRONMENT"))
+    return bool(
+        os.environ.get("RAILWAY_SERVICE_ID") or
+        os.environ.get("RAILWAY_PROJECT_ID") or
+        os.environ.get("RAILWAY_ENVIRONMENT") or
+        os.environ.get("RAILWAY_STATIC_URL") or
+        os.environ.get("PORT")  # Railway auto-sets PORT for web processes
+    )
 
 def _is_choreo() -> bool:
     """Detect if running on Choreo (WSO2 Developer Platform)."""
@@ -4049,9 +4055,10 @@ _active_sessions_lock = threading.Lock()
 def _save_active_session(chat_id, file_path: str, file_name: str, lines: list,
                          user_data: dict, progress: int = 0,
                          original_total: int = 0, already_done: int = 0):
-    """Persist an active checking session to disk for crash recovery.
-    Also saves a copy of the combo file to saved_combos/ so it survives restarts.
-    
+    """Persist an active checking session to disk + KeyVault API for crash recovery.
+    Also saves a copy of the combo file to saved_combos/ AND KeyVault API
+    so it survives Railway restarts (ephemeral filesystem).
+
     The 'lines' parameter should contain the REMAINING lines to check.
     'progress' is the number of lines already processed in THIS run (since last trim).
     'original_total' is the total from the VERY FIRST run (e.g. 100 for a 100-line file).
@@ -4087,11 +4094,32 @@ def _save_active_session(chat_id, file_path: str, file_name: str, lines: list,
         }
         _flush_active_sessions()
 
+    # ── Also save combo file content to KeyVault API for Railway persistence ──
+    # Railway has ephemeral filesystem — saved_combos/ is wiped on every deploy.
+    # The KeyVault API persists data across redeploys, so the combo file
+    # can be restored even after a full container restart.
+    try:
+        api = _get_keysystem_api()
+        if api and api.enabled:
+            combo_key = f"combo_{chat_id}_{file_name}"
+            api.save_state(combo_key, {
+                "lines": lines,
+                "file_name": file_name,
+                "chat_id": chat_id,
+                "progress": progress,
+                "original_total": original_total or len(lines),
+                "already_done": already_done,
+                "saved_at": time.time(),
+            })
+    except Exception as e:
+        logger.debug(f"[BOT] Could not sync combo to KeyVault: {e}")
+
 
 def _update_session_progress(chat_id, progress: int):
     """Update the progress counter for an active session.
     Also trims the persistent combo file every 10 accounts to reduce disk I/O.
-    
+    Also syncs to KeyVault API every 10 accounts for Railway persistence.
+
     Progress is saved every account (precise crash recovery — no re-checking).
     File trimming happens every 10 accounts (disk I/O is expensive).
     On resume, if progress > 0 but file isn't trimmed yet, _auto_resume_sessions
@@ -4108,6 +4136,9 @@ def _update_session_progress(chat_id, progress: int):
             if progress % 10 != 0:
                 return
             persistent_path = _active_sessions[key].get("persistent_path", "")
+            file_name = _active_sessions[key].get("file_name", "")
+            old_already_done = _active_sessions[key].get("already_done", 0)
+            remaining = None
             if persistent_path and os.path.exists(persistent_path):
                 try:
                     with open(persistent_path, "r", encoding="utf-8", errors="ignore") as fh:
@@ -4117,19 +4148,72 @@ def _update_session_progress(chat_id, progress: int):
                         with open(persistent_path, "w", encoding="utf-8") as fh:
                             fh.write("\n".join(remaining) + "\n")
                         # Update total_lines to reflect remaining
-                        old_progress = _active_sessions[key].get("progress", 0)
-                        old_already_done = _active_sessions[key].get("already_done", 0)
                         _active_sessions[key]["total_lines"] = len(remaining)
                         _active_sessions[key]["progress"] = 0  # reset since file is now trimmed
                         # Accumulate already_done: previous already_done + progress just made
-                        _active_sessions[key]["already_done"] = old_already_done + old_progress
+                        _active_sessions[key]["already_done"] = old_already_done + progress
                         _flush_active_sessions()
                 except Exception as e:
                     logger.debug(f"[BOT] Could not trim persistent combo for {chat_id}: {e}")
+            else:
+                # File doesn't exist on disk (ephemeral FS on Railway)
+                # Still need to sync remaining lines to KeyVault
+                remaining = None  # will try to read from KeyVault below
+
+            # ── Sync remaining lines to KeyVault API every 10 accounts ──
+            # This ensures the combo file survives Railway's ephemeral filesystem.
+            try:
+                api = _get_keysystem_api()
+                if api and api.enabled and file_name:
+                    if remaining is not None:
+                        # We have the trimmed remaining lines from disk
+                        combo_key = f"combo_{chat_id}_{file_name}"
+                        api.save_state(combo_key, {
+                            "lines": remaining,
+                            "file_name": file_name,
+                            "chat_id": chat_id,
+                            "progress": 0,  # file is trimmed, progress reset
+                            "original_total": _active_sessions[key].get("original_total", 0),
+                            "already_done": old_already_done + progress,
+                            "saved_at": time.time(),
+                        })
+                    else:
+                        # No local file — load from KeyVault and trim in memory
+                        combo_key = f"combo_{chat_id}_{file_name}"
+                        saved = api.load_state(combo_key)
+                        if saved and isinstance(saved, dict):
+                            kv_lines = saved.get("lines", [])
+                            kv_progress = saved.get("progress", 0)
+                            total_progress = kv_progress + progress
+                            if total_progress < len(kv_lines):
+                                kv_remaining = kv_lines[total_progress:]
+                                api.save_state(combo_key, {
+                                    "lines": kv_remaining,
+                                    "file_name": file_name,
+                                    "chat_id": chat_id,
+                                    "progress": 0,
+                                    "original_total": _active_sessions[key].get("original_total", 0),
+                                    "already_done": old_already_done + total_progress,
+                                    "saved_at": time.time(),
+                                })
+                                # Also write to local disk for next time
+                                if persistent_path:
+                                    try:
+                                        os.makedirs(os.path.dirname(persistent_path), exist_ok=True)
+                                        with open(persistent_path, "w", encoding="utf-8") as fh:
+                                            fh.write("\n".join(kv_remaining) + "\n")
+                                        _active_sessions[key]["total_lines"] = len(kv_remaining)
+                                        _active_sessions[key]["progress"] = 0
+                                        _active_sessions[key]["already_done"] = old_already_done + total_progress
+                                        _flush_active_sessions()
+                                    except Exception:
+                                        pass
+            except Exception as e:
+                logger.debug(f"[BOT] Could not sync combo progress to KeyVault: {e}")
 
 
 def _remove_active_session(chat_id, delete_combo=True):
-    """Remove a completed/stopped session from disk.
+    """Remove a completed/stopped session from disk AND KeyVault API.
     Also removes the persistent combo file unless delete_combo=False."""
     key = str(chat_id)
     with _active_sessions_lock:
@@ -4153,6 +4237,14 @@ def _remove_active_session(chat_id, delete_combo=True):
                     os.remove(default_path)
                 except Exception:
                     pass
+            # Also clean up from KeyVault API
+            try:
+                api = _get_keysystem_api()
+                if api and api.enabled:
+                    combo_key = f"combo_{chat_id}_{fname}"
+                    api.delete_state(combo_key)
+            except Exception:
+                pass
 
 
 def _flush_active_sessions():
@@ -5730,7 +5822,32 @@ def _resume_proxy_paused_users(token: str):
                 combo_path = candidate
                 break
 
+        # ── If local file is missing, try KeyVault API ──
+        kv_lines = None
+        kv_already_done = 0
         if not combo_path:
+            try:
+                api = _get_keysystem_api()
+                if api and api.enabled and file_name:
+                    combo_key = f"combo_{chat_id}_{file_name}"
+                    saved = api.load_state(combo_key)
+                    if saved and isinstance(saved, dict) and saved.get("lines"):
+                        kv_lines = saved["lines"]
+                        kv_already_done = saved.get("already_done", 0)
+                        logger.info(f"[BOT] Proxy-resume: restored {len(kv_lines)} lines from KeyVault")
+                        # Write to disk for future use
+                        os.makedirs(SAVED_COMBOS_DIR, exist_ok=True)
+                        disk_path = os.path.join(SAVED_COMBOS_DIR, f"paused_{chat_id}_{file_name}")
+                        try:
+                            with open(disk_path, "w", encoding="utf-8") as fh:
+                                fh.write("\n".join(kv_lines) + "\n")
+                            combo_path = disk_path
+                        except Exception:
+                            pass
+            except Exception as e:
+                logger.debug(f"[BOT] Could not load combo from KeyVault for proxy-resume: {e}")
+
+        if not combo_path and kv_lines is None:
             _tg_send(token, chat_id,
                 "⚠️ <b>Proxies are back!</b>\n\n"
                 "But your combo file was lost. Please re-upload it.")
@@ -5738,13 +5855,17 @@ def _resume_proxy_paused_users(token: str):
 
         # Read lines from the combo file — the file already contains only remaining lines
         all_lines = []
-        for enc in ["utf-8", "latin-1", "cp1252", "iso-8859-1"]:
-            try:
-                with open(combo_path, "r", encoding=enc, errors="ignore") as fh:
-                    all_lines = [l.strip() for l in fh if l.strip() and ":" in l]
-                break
-            except Exception:
-                continue
+        if combo_path:
+            for enc in ["utf-8", "latin-1", "cp1252", "iso-8859-1"]:
+                try:
+                    with open(combo_path, "r", encoding=enc, errors="ignore") as fh:
+                        all_lines = [l.strip() for l in fh if l.strip() and ":" in l]
+                    break
+                except Exception:
+                    continue
+        # Fallback to KeyVault lines if local file was empty
+        if not all_lines and kv_lines is not None:
+            all_lines = [l.strip() for l in kv_lines if l.strip() and ":" in l]
 
         if not all_lines:
             _tg_send(token, chat_id,
@@ -5763,6 +5884,9 @@ def _resume_proxy_paused_users(token: str):
         total = sess.get("total_lines", len(remaining_lines))
         proxy_original_total = sess.get("original_total", progress + len(remaining_lines))
         proxy_already_done = sess.get("already_done", progress)
+        # Use KeyVault's already_done if it's more up-to-date
+        if kv_already_done > proxy_already_done:
+            proxy_already_done = kv_already_done
 
         if not remaining_lines:
             _tg_send(token, chat_id,
@@ -9802,8 +9926,33 @@ def _auto_resume_sessions(token: str):
                 combo_path = candidate
                 break
 
+        # ── If local file is missing, try KeyVault API (Railway ephemeral FS) ──
+        kv_lines = None  # lines loaded from KeyVault
+        kv_already_done = 0  # already_done from KeyVault metadata
         if not combo_path:
-            logger.warning(f"[BOT] Resume skip: file gone for chat {chat_id}")
+            try:
+                api = _get_keysystem_api()
+                if api and api.enabled and file_name:
+                    combo_key = f"combo_{chat_id}_{file_name}"
+                    saved = api.load_state(combo_key)
+                    if saved and isinstance(saved, dict) and saved.get("lines"):
+                        kv_lines = saved["lines"]
+                        kv_already_done = saved.get("already_done", 0)
+                        logger.info(f"[BOT] Resume: restored {len(kv_lines)} lines from KeyVault for chat {chat_id}")
+                        # Also write to disk for future use
+                        os.makedirs(SAVED_COMBOS_DIR, exist_ok=True)
+                        disk_path = os.path.join(SAVED_COMBOS_DIR, f"{chat_id}_{file_name}")
+                        try:
+                            with open(disk_path, "w", encoding="utf-8") as fh:
+                                fh.write("\n".join(kv_lines) + "\n")
+                            combo_path = disk_path
+                        except Exception:
+                            pass
+            except Exception as e:
+                logger.debug(f"[BOT] Could not load combo from KeyVault: {e}")
+
+        if not combo_path and kv_lines is None:
+            logger.warning(f"[BOT] Resume skip: file gone for chat {chat_id} (not on disk or KeyVault)")
             # Only notify user if we haven't notified them recently (cooldown 5 min)
             _last_notify = _resume_notify_ts.get(str(chat_id), 0)
             if time.time() - _last_notify > 300:
@@ -9820,13 +9969,19 @@ def _auto_resume_sessions(token: str):
         # The persistent file is already trimmed by _update_session_progress,
         # so it only contains unprocessed lines. Read ALL of them.
         all_lines = []
-        for enc in ["utf-8", "latin-1", "cp1252", "iso-8859-1"]:
-            try:
-                with open(combo_path, "r", encoding=enc, errors="ignore") as fh:
-                    all_lines = [l.strip() for l in fh if l.strip() and ":" in l]
-                break
-            except Exception:
-                continue
+        if combo_path:
+            for enc in ["utf-8", "latin-1", "cp1252", "iso-8859-1"]:
+                try:
+                    with open(combo_path, "r", encoding=enc, errors="ignore") as fh:
+                        all_lines = [l.strip() for l in fh if l.strip() and ":" in l]
+                    break
+                except Exception:
+                    continue
+
+        # If local file was empty/missing, use lines from KeyVault
+        if not all_lines and kv_lines is not None:
+            all_lines = [l.strip() for l in kv_lines if l.strip() and ":" in l]
+            logger.info(f"[BOT] Resume: using {len(all_lines)} lines from KeyVault (local file empty)")
 
         if not all_lines:
             _last_notify = _resume_notify_ts.get(str(chat_id), 0)
@@ -9862,6 +10017,10 @@ def _auto_resume_sessions(token: str):
         # already_done = total processed across all previous runs (e.g. 50)
         saved_original_total = sess.get("original_total", 0)
         saved_already_done = sess.get("already_done", 0)
+        # If we loaded from KeyVault, use its already_done (which may be more up-to-date
+        # than the session data, since session data on Railway gets wiped on restart)
+        if kv_already_done > saved_already_done:
+            saved_already_done = kv_already_done
         # Calculate effective values if not stored (backward compat)
         if not saved_original_total:
             saved_original_total = progress + len(remaining_lines)
