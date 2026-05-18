@@ -1,5 +1,5 @@
 {
-  "vip_threads": 3,
+  "vip_threads": 5,
   "free_threads": 2,
   "timeout": 15,
   "retry_count": 2,

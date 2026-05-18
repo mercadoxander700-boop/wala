@@ -165,18 +165,22 @@ FREE_THREADS_PER_USER = 2     # Free key users: 2 threads — queued, waits for 
 # Max users running the checker simultaneously
 MAX_CONCURRENT_USERS = 10     # 10 users supported concurrently
 # VIP users get higher thread count for faster checking — NO QUEUE
-VIP_THREADS_PER_USER = 3      # VIP users: 3 threads — instant, no queuing
+VIP_THREADS_PER_USER = 5      # VIP users: 5 threads — instant, no queuing
 # Legacy alias — kept for backward compat in some messages
 MAX_THREADS_PER_USER = FREE_THREADS_PER_USER
 
 # Global semaphore — enforces MAX_GLOBAL_THREADS hard cap
 _global_thread_sem = threading.Semaphore(MAX_GLOBAL_THREADS)
+# Memory throttle flag — set by watchdog, checked by workers before acquiring semaphore
+# This replaces unsafe direct semaphore._value manipulation that caused corruption
+_memory_throttle_delay = 0.0  # seconds to sleep before acquiring global sem (0 = no throttle)
 
 # ══════════════════════════════════════════════════════════════
 #  GEO PROXY CONFIG  (auto-reads all .txt files from proxy/ folder, loops)
 # ══════════════════════════════════════════════════════════════
 PROXY_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxy")
 SAVED_COMBOS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_combos")
+SAVED_RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_results")
 SAVED_PROXIES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_proxies")
 
 def _init_proxy_folder():
@@ -3285,8 +3289,8 @@ def create_thread_session(cookie_manager, datadome_manager):
     3. Always attempt to get a fresh DataDome cookie for the session"""
     sess = cloudscraper.create_scraper()
     adapter = requests.adapters.HTTPAdapter(
-        pool_connections=3,
-        pool_maxsize=5,
+        pool_connections=2,
+        pool_maxsize=3,
         max_retries=1,
     )
     sess.mount("http://",  adapter)
@@ -3348,7 +3352,8 @@ def _cleanup_stale_files():
     """
     Delete leftover combo/ and *_results/ folders from previous crashes.
     Called once at bot startup to recover disk space.
-    NOTE: Does NOT touch saved_combos/ or saved_proxies/ — those are persistent across restarts.
+    NOTE: Does NOT touch saved_combos/, saved_results/, or saved_proxies/ —
+    those are persistent across restarts for auto-resume and result preservation.
     """
     import shutil, glob
     base = os.path.dirname(os.path.abspath(__file__))
@@ -3365,9 +3370,13 @@ def _cleanup_stale_files():
             except Exception:
                 pass
 
-    # *_results/ folders — unzipped result dirs (base dir and inside combo/)
+    # *_results/ folders in base dir and combo/ — old ephemeral results (safe to delete)
+    # saved_results/ is NOT touched — it persists across restarts for result preservation
     for pattern in [os.path.join(base, "*_results"), os.path.join(combo_dir, "*_results")]:
         for d in glob.glob(pattern):
+            # Skip the saved_results directory itself
+            if os.path.abspath(d) == os.path.abspath(SAVED_RESULTS_DIR):
+                continue
             try:
                 shutil.rmtree(d, ignore_errors=True)
                 logger.warning(f"[CLEANUP] Removed stale results folder: {os.path.basename(d)}")
@@ -3375,8 +3384,9 @@ def _cleanup_stale_files():
                 pass
 
     # saved_combos/ is NEVER cleaned — these persist across restarts for auto-resume
+    # saved_results/ is NEVER cleaned at startup — results persist for resume & final zip
     # saved_proxies/ is NEVER cleaned — these persist across restarts for proxy auto-restore
-    # Individual combo files are removed by _remove_active_session() when checks complete
+    # Individual files are removed by _remove_active_session() when checks complete
 
 
 # ══════════════════════════════════════════════════════════════
@@ -4054,7 +4064,8 @@ _active_sessions_lock = threading.Lock()
 
 def _save_active_session(chat_id, file_path: str, file_name: str, lines: list,
                          user_data: dict, progress: int = 0,
-                         original_total: int = 0, already_done: int = 0):
+                         original_total: int = 0, already_done: int = 0,
+                         result_folder: str = ""):
     """Persist an active checking session to disk + KeyVault API for crash recovery.
     Also saves a copy of the combo file to saved_combos/ AND KeyVault API
     so it survives Railway restarts (ephemeral filesystem).
@@ -4063,6 +4074,7 @@ def _save_active_session(chat_id, file_path: str, file_name: str, lines: list,
     'progress' is the number of lines already processed in THIS run (since last trim).
     'original_total' is the total from the VERY FIRST run (e.g. 100 for a 100-line file).
     'already_done' is the total processed across ALL runs (before this session started).
+    'result_folder' is the path to the persistent result folder for this session.
     On resume, original_total and already_done allow showing "50/100" instead of "0/50".
     """
     # ── Save combo file to persistent directory ──
@@ -4085,6 +4097,7 @@ def _save_active_session(chat_id, file_path: str, file_name: str, lines: list,
             "progress": progress,
             "original_total": original_total or len(lines),
             "already_done": already_done,
+            "result_folder": result_folder,
             "level": user_data.get("level", [1]),
             "clean_filter": user_data.get("clean_filter", "both"),
             "hits_id": user_data.get("hits_id", chat_id),
@@ -4212,9 +4225,11 @@ def _update_session_progress(chat_id, progress: int):
                 logger.debug(f"[BOT] Could not sync combo progress to KeyVault: {e}")
 
 
-def _remove_active_session(chat_id, delete_combo=True):
+def _remove_active_session(chat_id, delete_combo=True, delete_results=True):
     """Remove a completed/stopped session from disk AND KeyVault API.
-    Also removes the persistent combo file unless delete_combo=False."""
+    Also removes the persistent combo file unless delete_combo=False.
+    Also removes the persistent result folder unless delete_results=False."""
+    import shutil as _shutil
     key = str(chat_id)
     with _active_sessions_lock:
         sess = _active_sessions.pop(key, None)
@@ -4243,6 +4258,15 @@ def _remove_active_session(chat_id, delete_combo=True):
                 if api and api.enabled:
                     combo_key = f"combo_{chat_id}_{fname}"
                     api.delete_state(combo_key)
+            except Exception:
+                pass
+    # Clean up persistent result folder (after zip has been sent)
+    if delete_results and sess:
+        rf = sess.get("result_folder", "")
+        if rf and os.path.isdir(rf):
+            try:
+                _shutil.rmtree(rf, ignore_errors=True)
+                logger.debug(f"[BOT] Removed persistent results: {rf}")
             except Exception:
                 pass
 
@@ -4668,9 +4692,15 @@ def _handle_file(token: str, chat_id, message: dict, from_user: dict = None):
     with _state_lock:
         _bot_state[chat_id] = "RUNNING"
 
+    # ── Pre-compute persistent result folder so it's stored in session metadata ──
+    _base_name = os.path.splitext(os.path.basename(clean_path))[0]
+    _initial_result_folder = os.path.join(SAVED_RESULTS_DIR, f"{chat_id}_{_base_name}")
+    os.makedirs(_initial_result_folder, exist_ok=True)
+
     # ── Save active session for auto-resume on crash ───────────
     _save_active_session(chat_id, clean_path, file_name, clean_lines, d,
-                         original_total=len(clean_lines), already_done=0)
+                         original_total=len(clean_lines), already_done=0,
+                         result_folder=_initial_result_folder)
 
     # ── Create a per-user stop event ───────────────────────────
     stop_evt = threading.Event()
@@ -4711,11 +4741,14 @@ def _handle_file(token: str, chat_id, message: dict, from_user: dict = None):
             except Exception:
                 pass
 
-        # ── Delete result folder (read from shared container) ───
+        # ── Delete result folder ONLY if it's NOT in saved_results/ ───
+        # Persistent results in saved_results/ survive crashes for auto-resume;
+        # they are cleaned up by _remove_active_session() after zip is sent.
         try:
             rf = _rf[0]
             if rf and os.path.isdir(rf):
-                shutil.rmtree(rf, ignore_errors=True)
+                if not os.path.abspath(rf).startswith(os.path.abspath(SAVED_RESULTS_DIR)):
+                    shutil.rmtree(rf, ignore_errors=True)
         except Exception:
             pass
 
@@ -4756,7 +4789,8 @@ def _handle_file(token: str, chat_id, message: dict, from_user: dict = None):
             stats, result_folder = _run_checker_for_file(
                 clean_path, user_telegram_config,
                 chat_id=chat_id, label=label,
-                stop_event=stop_evt
+                stop_event=stop_evt,
+                result_folder=_initial_result_folder
             )
             _rf[0] = result_folder   # store in shared container for _cleanup_files
             stopped = stop_evt.is_set()
@@ -4779,7 +4813,8 @@ def _handle_file(token: str, chat_id, message: dict, from_user: dict = None):
             with _stop_events_lock:
                 _stop_events.pop(chat_id, None)
             # Remove from active sessions (no longer needs resume)
-            _remove_active_session(chat_id)
+            # Keep result folder alive until zip is sent below
+            _remove_active_session(chat_id, delete_results=False)
 
             if stopped:
                 _tg_send(token, chat_id,
@@ -4830,8 +4865,17 @@ def _handle_file(token: str, chat_id, message: dict, from_user: dict = None):
                 _tg_send(token, chat_id,
                     "📭 <b>No result files</b> — no valid hits found.")
 
-            # ── Delete combo files + result folder ──────────────
+            # ── Delete combo files (result folder kept for zip above) ──
             _cleanup_files()
+
+            # ── Now safe to delete persistent result folder after zip sent ──
+            import shutil as _shutil_rf
+            try:
+                rf = _rf[0]
+                if rf and os.path.isdir(rf):
+                    _shutil_rf.rmtree(rf, ignore_errors=True)
+            except Exception:
+                pass
 
             # Force GC after each check run to free memory on Railway
             gc.collect()
@@ -5217,14 +5261,21 @@ def _get_user_tier(chat_id) -> str:
     return cached_tier or "free"
 
 
-def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, label: str = "user", stop_event=None, original_total: int = 0, already_done: int = 0) -> tuple:
-    """Returns (stats_dict, result_folder_path)"""
+def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, label: str = "user", stop_event=None, original_total: int = 0, already_done: int = 0, result_folder: str = "") -> tuple:
+    """Returns (stats_dict, result_folder_path).
+    If result_folder is provided (e.g. from a resumed session), reuse it
+    so partial results from before the crash are preserved (append mode)."""
     if not os.path.exists(filepath):
         logger.error(f"[BOT] File not found: {filepath}")
         return {}, ""
 
-    base          = os.path.splitext(os.path.basename(filepath))[0]
-    result_folder = os.path.join(os.path.dirname(os.path.abspath(filepath)), f"{base}_results")
+    if not result_folder:
+        # Use persistent saved_results/ dir so results survive crashes
+        base = os.path.splitext(os.path.basename(filepath))[0]
+        if chat_id:
+            result_folder = os.path.join(SAVED_RESULTS_DIR, f"{chat_id}_{base}")
+        else:
+            result_folder = os.path.join(os.path.dirname(os.path.abspath(filepath)), f"{base}_results")
     os.makedirs(result_folder, exist_ok=True)
 
     accounts = []
@@ -5424,6 +5475,7 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
     # (via the finally block in error paths), corrupting the semaphore count
     # and causing OTHER users' checkers to restart.
     def vip_worker():
+        _vip_gc_counter = 0
         while not pq.should_stop():
             # Step 1: Acquire VIP slot (instant — dedicated VIP pool)
             if not pq.acquire_vip_slot(timeout=0.5):
@@ -5463,6 +5515,10 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
             # Step 4: Acquire global thread slot, then process
             # Only acquire AFTER confirming we have an account and we're not stopping.
             # This prevents semaphore corruption that causes other users to restart.
+            # Memory throttle: sleep before acquire to slow down under high RAM
+            _td = _memory_throttle_delay
+            if _td > 0:
+                time.sleep(_td)
             _global_thread_sem.acquire()
             try:
                 _do_account(account['line'], account['idx'])
@@ -5476,6 +5532,11 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
             pq.mark_vip_done()
             _update_progress()
 
+            # Periodic GC every 50 accounts to prevent memory accumulation
+            _vip_gc_counter += 1
+            if _vip_gc_counter % 50 == 0:
+                gc.collect()
+
     # ── Free Worker: Acquires slot FIRST (BLOCKS if full = QUEUE), then processes ──
     # KEY: Free semaphore is acquired BEFORE pulling from queue.
     # If all free_threads slots are taken, the worker WAITS here — this IS the queue.
@@ -5486,6 +5547,7 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
     # prevents the semaphore count corruption that caused checker restarts
     # when multiple users (VIP + Free) were running simultaneously.
     def free_worker():
+        _free_gc_counter = 0
         while not pq.should_stop():
             # Step 1: Acquire Free slot — THIS IS THE QUEUE
             # If all free_threads slots are busy, worker blocks here until one opens
@@ -5526,6 +5588,10 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
             # Step 4: Acquire global thread slot, then process
             # Only acquire AFTER confirming we have an account and we're not stopping.
             # This prevents semaphore corruption that causes other users to restart.
+            # Memory throttle: sleep before acquire to slow down under high RAM
+            _td = _memory_throttle_delay
+            if _td > 0:
+                time.sleep(_td)
             _global_thread_sem.acquire()
             try:
                 _do_account(account['line'], account['idx'])
@@ -5538,6 +5604,11 @@ def _run_checker_for_file(filepath: str, telegram_config: tuple, chat_id=None, l
             pq.release_free_slot()
             pq.mark_free_done()
             _update_progress()
+
+            # Periodic GC every 50 accounts to prevent memory accumulation
+            _free_gc_counter += 1
+            if _free_gc_counter % 50 == 0:
+                gc.collect()
 
     # ── Start workers ──
     workers = []
@@ -5964,7 +6035,7 @@ def _resume_proxy_paused_users(token: str):
                     _bot_state[cid] = "AWAIT_FILE"
                 with _stop_events_lock:
                     _stop_events.pop(cid, None)
-                _remove_active_session(cid)
+                _remove_active_session(cid, delete_results=False)
 
                 if stopped:
                     _tg_send(token, cid,
@@ -6015,6 +6086,14 @@ def _resume_proxy_paused_users(token: str):
                 try:
                     if os.path.exists(rpath):
                         os.remove(rpath)
+                except Exception:
+                    pass
+
+                # Now safe to delete persistent result folder after zip sent
+                import shutil as _shutil_proxy
+                try:
+                    if result_folder and os.path.isdir(result_folder):
+                        _shutil_proxy.rmtree(result_folder, ignore_errors=True)
                 except Exception:
                     pass
 
@@ -9914,6 +9993,7 @@ def _auto_resume_sessions(token: str):
         file_name  = sess.get("file_name", "unknown.txt")
         progress   = sess.get("progress", 0)
         total      = sess.get("total_lines", 0)
+        saved_result_folder = sess.get("result_folder", "")
 
         if not chat_id:
             continue
@@ -10064,9 +10144,11 @@ def _auto_resume_sessions(token: str):
             _bot_state[chat_id] = "RUNNING"
 
         # Update session with new file path (also re-saves to persistent dir)
-        # Pass original_total and already_done so progress shows correctly (e.g. 50/100)
+        # Pass original_total, already_done, and result_folder so progress shows correctly
+        # and results accumulate in the same folder across restarts
         _save_active_session(chat_id, resume_path, file_name, remaining_lines, d, 0,
-                             original_total=saved_original_total, already_done=already_done)
+                             original_total=saved_original_total, already_done=already_done,
+                             result_folder=saved_result_folder)
 
         stop_evt = threading.Event()
         with _stop_events_lock:
@@ -10074,12 +10156,14 @@ def _auto_resume_sessions(token: str):
 
         def _resume_run(cid=chat_id, rpath=resume_path, tg_cfg=user_telegram_config,
                         se=stop_evt, fn=file_name, rem=len(remaining_lines),
-                        ot=saved_original_total, ad=already_done):
+                        ot=saved_original_total, ad=already_done,
+                        srf=saved_result_folder):
             try:
                 label = f"resume:{cid}"
                 stats, result_folder = _run_checker_for_file(
                     rpath, tg_cfg, chat_id=cid, label=label, stop_event=se,
-                    original_total=ot, already_done=ad
+                    original_total=ot, already_done=ad,
+                    result_folder=srf
                 )
                 stopped = se.is_set()
             except Exception as e:
@@ -10092,7 +10176,7 @@ def _auto_resume_sessions(token: str):
                     _bot_state[cid] = "AWAIT_FILE"
                 with _stop_events_lock:
                     _stop_events.pop(cid, None)
-                _remove_active_session(cid)
+                _remove_active_session(cid, delete_results=False)
 
                 if stopped:
                     _tg_send(token, cid,
@@ -10146,6 +10230,14 @@ def _auto_resume_sessions(token: str):
                 except Exception:
                     pass
 
+                # Now safe to delete persistent result folder after zip sent
+                import shutil as _shutil_resume
+                try:
+                    if result_folder and os.path.isdir(result_folder):
+                        _shutil_resume.rmtree(result_folder, ignore_errors=True)
+                except Exception:
+                    pass
+
                 gc.collect()
                 _tg_send(token, cid,
                     f"📂 Send your next combo file to check again.\n"
@@ -10155,11 +10247,34 @@ def _auto_resume_sessions(token: str):
         logger.info(f"[BOT] 🔄 Resumed session for chat_id={chat_id}, {len(remaining_lines)} remaining")
 
 
+# Module-level executor — reused across crash-guard restarts to prevent thread leaks
+_poll_executor = None
+_poll_executor_lock = threading.Lock()
+
+def _get_poll_executor():
+    """Get or create the polling ThreadPoolExecutor. Reuses existing if alive."""
+    global _poll_executor
+    with _poll_executor_lock:
+        if _poll_executor is None or _poll_executor._shutdown:
+            _poll_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="BotUpdate")
+        return _poll_executor
+
+def _shutdown_poll_executor():
+    """Gracefully shutdown the polling executor (called by crash guard before restart)."""
+    global _poll_executor
+    with _poll_executor_lock:
+        if _poll_executor is not None:
+            try:
+                _poll_executor.shutdown(wait=False)
+            except Exception:
+                pass
+            _poll_executor = None
+
 # ── long-poll loop (single daemon thread, handles all users) ───
 def start_bot_polling(token: str, _unused=None):
     offset = 0
     consecutive_errors = 0
-    _update_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="BotUpdate")
+    _update_executor = _get_poll_executor()
 
     def _create_poll_session():
         """Create a fresh polling session with keep-alive."""
@@ -10226,12 +10341,14 @@ def start_bot_polling(token: str, _unused=None):
                     offset = upd["update_id"] + 1
                     _update_executor.submit(_safe_handle, upd)
             except requests.exceptions.Timeout:
-                # Long-poll timeout is normal — just loop again immediately
+                # Long-poll timeout is normal — bot is alive and polling
+                _touch_liveness()
                 continue
             except (requests.exceptions.ConnectionError,
                     requests.exceptions.ChunkedEncodingError,
                     ConnectionResetError, OSError) as e:
                 consecutive_errors += 1
+                _touch_liveness()  # bot is alive, just network issues
                 wait = min(5 * consecutive_errors, 30)
                 logger.warning(f"[BOT] Connection error #{consecutive_errors}: {e} — retrying in {wait}s")
                 time.sleep(wait)
@@ -10246,6 +10363,7 @@ def start_bot_polling(token: str, _unused=None):
                     consecutive_errors = 0
             except Exception as e:
                 consecutive_errors += 1
+                _touch_liveness()  # bot process is alive, just poll error
                 logger.warning(f"[BOT] Poll error: {e}")
                 time.sleep(5)
 
@@ -10314,30 +10432,22 @@ def _start_healthcheck_server():
                         "message": f"Bot is initializing ({int(_uptime)}s uptime — grace period)",
                     }).encode())
                     return
+                # ALWAYS return 200 while process is running.
+                # An idle bot waiting for Telegram messages IS healthy.
+                # Railway's restart policy handles actual process crashes.
+                # Returning 503 for "no activity" caused Railway to kill
+                # a perfectly healthy idle bot, triggering restart loops.
                 age = _get_liveness_age()
-                # ANTI-OVERHEAT: increased unhealthy threshold from 900s (15min) to 1800s (30min)
-                # 15min was too aggressive — during normal quiet periods the bot
-                # might not poll for 15min, causing Railway to restart unnecessarily.
-                if age > 1800:
-                    self.send_response(503)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(json.dumps({
-                        "status": "unhealthy",
-                        "reason": f"no activity for {int(age)}s",
-                    }).encode())
-                    logger.warning(f"[HEALTH] ❌ Healthcheck FAILED — no activity for {int(age)}s")
-                else:
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    active = sum(1 for s in _bot_state.values() if s == "RUNNING")
-                    self.wfile.write(json.dumps({
-                        "status": "healthy",
-                        "active_checkers": active,
-                        "liveness_age_s": int(age),
-                        "proxies": geo_rotator.total if hasattr(geo_rotator, "total") else 0,
-                    }).encode())
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                active = sum(1 for s in _bot_state.values() if s == "RUNNING")
+                self.wfile.write(json.dumps({
+                    "status": "healthy",
+                    "active_checkers": active,
+                    "liveness_age_s": int(age),
+                    "proxies": geo_rotator.total if hasattr(geo_rotator, "total") else 0,
+                }).encode())
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -10559,26 +10669,27 @@ def main():
         logger.warning(f"[MAIN] Failed to send restart notification: {e}")
 
     # ── Memory watchdog — 3-tier adaptive throttle ───────────────
-    # Tier 1 (>80%): reduce to 3 threads (warn)
-    # Tier 2 (>87%): reduce to 2 threads (critical)
-    # Tier 3 (>93%): reduce to 1 thread  (emergency — stop new work)
+    # Instead of draining/restoring semaphore slots (which corrupted the
+    # semaphore count and caused cascading restarts), we use a safe
+    # throttle-delay approach: workers sleep before acquiring the global
+    # semaphore, naturally slowing down new work without corrupting state.
+    #
+    # Tier 1 (>85%): 2s delay per acquire (warn)
+    # Tier 2 (>90%): 5s delay per acquire (critical)
+    # Tier 3 (>95%): 10s delay per acquire (emergency — near-pause)
     def _memory_watchdog():
+        global _memory_throttle_delay
         try:
             import psutil
         except ImportError:
             logger.warning("[WATCHDOG] psutil not installed — RAM watchdog disabled. Install with: pip install psutil")
             return
 
-        # Track last tier to avoid log spam
         last_tier = 0
-        _boot_time = time.time()  # ANTI-OVERHEAT: track startup time
+        _boot_time = time.time()
 
         while not shutdown_event.is_set():
             try:
-                # ── ANTI-OVERHEAT: Startup grace period (120s) ─────────
-                # During startup, only OBSERVE — don't drain semaphores.
-                # Startup often has high RAM briefly; draining semaphores
-                # mid-initialization can cause cascading failures and crashes.
                 uptime = time.time() - _boot_time
                 in_grace = uptime < 120
 
@@ -10586,57 +10697,43 @@ def main():
                 pct  = mem.percent
                 free = mem.available // (1024 * 1024)  # MB
 
-                # ── Determine tier ──────────────────────────────────────
-                if pct >= 93:
+                # ── Determine tier (raised thresholds — old 80% was too aggressive) ──
+                if pct >= 95:
                     tier   = 3
-                    target = 1
+                    delay  = 10.0
                     label  = "🚨 EMERGENCY"
-                elif pct >= 87:
+                elif pct >= 90:
                     tier   = 2
-                    target = 2
+                    delay  = 5.0
                     label  = "🔴 CRITICAL"
-                elif pct >= 80:
+                elif pct >= 85:
                     tier   = 1
-                    target = 3
+                    delay  = 2.0
                     label  = "🟡 WARNING"
                 else:
                     tier   = 0
-                    target = MAX_GLOBAL_THREADS
+                    delay  = 0.0
                     label  = "🟢 OK"
 
                 # ── Only act/log on tier change ──────────────────────
                 if tier != last_tier:
                     if tier > 0:
-                        # Force garbage collection on high memory
                         gc.collect()
                         if in_grace:
-                            # ANTI-OVERHEAT: During grace period, just log — don't drain
                             logger.warning(
                                 f"[WATCHDOG] {label} — RAM {pct:.1f}% ({free}MB free) "
                                 f"→ observation only (startup grace {int(uptime)}s/120s)"
                             )
                         else:
+                            _memory_throttle_delay = delay
                             logger.warning(
                                 f"[WATCHDOG] {label} — RAM {pct:.1f}% ({free}MB free) "
-                                f"→ throttling to {target} thread(s)"
+                                f"→ throttle delay {delay}s per thread acquire"
                             )
-                            # Drain excess semaphore slots down to target
-                            drained = 0
-                            while _global_thread_sem._value > target:
-                                if _global_thread_sem.acquire(blocking=False):
-                                    drained += 1
-                                else:
-                                    break
-                            if drained:
-                                logger.warning(f"[WATCHDOG] Drained {drained} slot(s) — semaphore now at {target}")
                     else:
-                        # Recovering — restore semaphore to full
-                        current = _global_thread_sem._value
-                        restore = MAX_GLOBAL_THREADS - current
-                        for _ in range(restore):
-                            _global_thread_sem.release()
-                        if restore:
-                            logger.info(f"[WATCHDOG] 🟢 RAM recovered ({pct:.1f}%) — restored {restore} thread slot(s)")
+                        _memory_throttle_delay = 0.0
+                        if last_tier > 0:
+                            logger.info(f"[WATCHDOG] 🟢 RAM recovered ({pct:.1f}%) — throttle removed")
                     last_tier = tier
 
                 # Tier 3 emergency: notify owner via Telegram
@@ -10645,7 +10742,7 @@ def main():
                         _tg_send(BOT_TOKEN, OWNER_ID,
                             f"🚨 <b>Server RAM Emergency!</b>\n\n"
                             f"RAM at <b>{pct:.1f}%</b> ({free}MB free)\n"
-                            f"Throttled to 1 checker thread.\n"
+                            f"Throttling all new work (10s delay).\n"
                             f"<i>Consider stopping some checkers with /stopall</i>")
                     except Exception:
                         pass
@@ -10653,39 +10750,36 @@ def main():
             except Exception as e:
                 logger.debug(f"[WATCHDOG] Error: {e}")
 
-            # Periodic GC every cycle to keep memory lean on Railway
-            try:
-                gc.collect()
-            except Exception:
-                pass
+            # GC only when memory is elevated (tier > 0) — not every cycle
+            if tier > 0:
+                try:
+                    gc.collect()
+                except Exception:
+                    pass
 
-            # Check every 15s (was 8s — less aggressive to reduce CPU overhead on Railway)
-            time.sleep(15)
+            # Check every 30s
+            time.sleep(30)
 
 
     # ── Railway keep-alive heartbeat ─────────────────────────
     def _liveness_watchdog():
-        """Enhanced heartbeat + liveness watchdog (ANTI-OVERHEAT v2).
-        Every 60s: log heartbeat and check liveness.
-        ANTI-OVERHEAT: thresholds are very generous to prevent restart loops:
-        - 30 minutes: warning message (was 15 min — too aggressive)
-        - 60 minutes: self-healing restart (was 30 min — too aggressive)
-        - Minimum 30-minute cooldown between self-heal attempts
-        - Maximum 2 self-heal attempts before giving up (was 3)
-        - Startup grace: no self-heal within first 120s of boot
-        The bot touches liveness every 30s via the main loop, and on every
-        successful Telegram poll + proxy fetch. Only trigger self-heal if
-        ALL of these are dead for a sustained period.
+        """Heartbeat watchdog for 24/7 uptime.
+        Every 60s: log heartbeat. Self-heal only if polling is truly dead
+        for an extended period (2 hours). Never gives up — keeps monitoring
+        forever with escalating cooldowns between self-heal attempts.
+        
+        With the polling timeout liveness touch fix, liveness age should
+        never exceed ~35s during normal operation (even when idle).
+        If it exceeds 2 hours, something is genuinely broken.
         """
         import time as _time
-        _boot_time = _time.time()  # when this watchdog started
+        _boot_time = _time.time()
         stuck_warned = False
-        restart_loop_count = 0  # track how many self-heals we've done
-        last_selfheal_time = 0  # cooldown between self-heals (minimum 30 min)
+        restart_loop_count = 0
+        last_selfheal_time = 0
         while not shutdown_event.is_set():
-            time.sleep(60)  # check every minute
+            time.sleep(60)
             try:
-                # ── Startup grace period: don't self-heal in first 120s ──
                 uptime = _time.time() - _boot_time
                 if uptime < 120:
                     logger.debug(f"[WATCHDOG] Startup grace period ({int(uptime)}s/120s) — skipping checks")
@@ -10694,55 +10788,35 @@ def main():
                 age = _get_liveness_age()
                 active = sum(1 for s in _bot_state.values() if s == "RUNNING")
 
-                if age > 3600:  # 60 minutes — no activity at all (was 30 min)
-                    # ── Cooldown: minimum 30 minutes between self-heals ──
+                if age > 7200:  # 2 hours — something is genuinely broken
                     now = _time.time()
+                    # Escalating cooldown: 30min, 60min, 120min (doubles each time, caps at 2h)
+                    cooldown = min(1800 * (2 ** min(restart_loop_count, 2)), 7200)
                     time_since_last_heal = now - last_selfheal_time
-                    if time_since_last_heal < 1800:  # 30 min cooldown
-                        remaining = int(1800 - time_since_last_heal)
+                    if time_since_last_heal < cooldown:
+                        remaining = int(cooldown - time_since_last_heal)
                         logger.warning(
                             f"[WATCHDOG] Self-heal cooldown active — {remaining}s remaining. "
-                            f"Bot has been inactive {int(age)}s but waiting for cooldown."
+                            f"Bot inactive {int(age)}s, waiting for cooldown."
                         )
                         continue
 
                     restart_loop_count += 1
                     last_selfheal_time = now
 
-                    # If we've self-healed 2 times already, just log and wait
-                    # instead of restarting forever (was 3 — reduced to prevent overheat)
-                    if restart_loop_count > 2:
-                        logger.error(f"[WATCHDOG] Self-healed {restart_loop_count} times — stopping restart loop. Bot will stay alive but idle.")
-                        try:
-                            _tg_send(BOT_TOKEN, OWNER_ID,
-                                f"🛑 <b>Self-Heal Stopped</b>\n\n"
-                                f"Bot has self-healed {restart_loop_count} times.\n"
-                                f"Stopping auto-restart to prevent overheat.\n\n"
-                                f"📋 <b>Check Railway logs for root cause.</b>\n"
-                                f"🔄 <b>Restart the service manually when ready.</b>"
-                            )
-                        except Exception:
-                            pass
-                        # Stop the loop — don't restart anymore
-                        return
-
-                    logger.error(f"[WATCHDOG] 🚨 Bot appears DEAD — no activity for {int(age)}s! Triggering self-healing restart (attempt {restart_loop_count})...")
+                    logger.error(f"[WATCHDOG] Bot appears DEAD — no activity for {int(age)}s! Self-heal attempt #{restart_loop_count}...")
                     try:
                         _tg_send(BOT_TOKEN, OWNER_ID,
-                            f"🚨 <b>Bot Self-Heal Triggered</b>\n\n"
-                            f"No activity detected for <b>{int(age/60)} minutes</b>.\n"
-                            f"Bot is restarting itself automatically (attempt {restart_loop_count}).\n\n"
-                            f"<i>You don't need to do anything.</i>"
+                            f"🚨 <b>Bot Self-Heal #{restart_loop_count}</b>\n\n"
+                            f"No activity for <b>{int(age/60)} min</b>.\n"
+                            f"Restarting automatically..."
                         )
-                        time.sleep(3)  # give message time to send
+                        time.sleep(3)
                     except Exception:
                         pass
-                    # Self-heal: trigger clean shutdown (NOT os.execv — that caused loops)
-                    # Railway will restart the container automatically after the process exits.
                     if _is_railway():
                         _railway_redeploy()
                     else:
-                        # Non-Railway: clean exit, the crash guard in __main__ will handle retry
                         global _shutting_down
                         _shutting_down = True
                         shutdown_event.set()
@@ -10750,22 +10824,24 @@ def main():
                             for evt in _stop_events.values():
                                 evt.set()
 
-                elif age > 1800:  # 30 minutes — concerning (was 15 min)
+                elif age > 3600:  # 1 hour — warning only
                     if not stuck_warned:
-                        logger.warning(f"[WATCHDOG] ⚠️ Bot may be stuck — no activity for {int(age)}s")
+                        logger.warning(f"[WATCHDOG] Bot may be stuck — no activity for {int(age)}s")
                         stuck_warned = True
                         try:
                             _tg_send(BOT_TOKEN, OWNER_ID,
                                 f"⚠️ <b>Bot May Be Stuck</b>\n\n"
-                                f"No activity for <b>{int(age/60)} minutes</b>.\n"
-                                f"Will auto-restart in 30 min if no recovery."
+                                f"No activity for <b>{int(age/60)} min</b>.\n"
+                                f"Will auto-restart in 1h if no recovery."
                             )
                         except Exception:
                             pass
                 else:
-                    stuck_warned = False  # recovered
-                    restart_loop_count = 0  # reset on recovery
-                    logger.info(f"[HEARTBEAT] 💓 Bot alive | {active} active | liveness: {int(age)}s ago | threads: {MAX_GLOBAL_THREADS}")
+                    if stuck_warned or restart_loop_count > 0:
+                        logger.info(f"[WATCHDOG] Bot recovered — liveness age {int(age)}s")
+                    stuck_warned = False
+                    restart_loop_count = 0
+                    logger.info(f"[HEARTBEAT] Bot alive | {active} active | liveness: {int(age)}s ago | threads: {MAX_GLOBAL_THREADS}")
             except Exception:
                 pass
     threading.Thread(target=_liveness_watchdog, daemon=True, name="LivenessWatchdog").start()
@@ -10865,28 +10941,37 @@ def main():
 
 
 if __name__ == "__main__":
-    # ── Crash guard with long backoffs to prevent Railway overheat ──────────
-    # PREVIOUS: 5 retries with 30s→480s backoff — too aggressive, caused overheat loops.
-    # NOW: 3 retries with 120s→600s backoff — gives Railway breathing room.
-    # After 3 crashes, exits cleanly instead of triggering _railway_redeploy()
-    # (which caused double-restart loops with Railway's own restart policy).
-    MAX_CRASH_RETRIES = 3
-    # Backoff schedule: 2min, 5min, 10min — long enough for Railway to cool down
-    CRASH_BACKOFFS = [120, 300, 600]
+    # ── Crash guard — INFINITE retries for true 24/7 uptime ──────────────
+    # The bot retries forever with escalating backoff. If main() runs for
+    # >10 minutes before crashing, backoff resets to short (transient issue).
+    # If it keeps crashing quickly, backoff escalates to 10 min max.
+    # Railway's ON_FAILURE restart policy is the last-resort safety net.
+    #
+    # Backoff schedule: 30s → 60s → 120s → 300s → 600s (capped)
+    CRASH_BACKOFFS = [30, 60, 120, 300, 600]
     crash_count = 0
-    while crash_count < MAX_CRASH_RETRIES:
+    _last_main_start = 0
+    while True:
         try:
             _shutting_down = False  # reset for new attempt
             shutdown_event.clear()   # reset shutdown flag for restart
+            _shutdown_poll_executor()  # kill leaked threads from previous run
+            _memory_throttle_delay = 0.0  # reset throttle for fresh start
             gc.collect()  # clean up before each run
+            _last_main_start = time.time()
             main()
-            crash_count = 0  # reset on clean exit (shutdown_event set)
-            break
-        except SystemExit:
-            # SystemExit = intentional shutdown (SIGTERM handled gracefully, etc.)
-            # Do NOT retry — this is NOT a crash.
+            # Clean exit (shutdown_event set) — restart immediately
+            # This handles self-heal shutdowns: bot exits cleanly, restarts fresh
+            crash_count = 0
             logger = logging.getLogger(__name__)
-            logger.info("[MAIN] Bot exited via SystemExit — intentional shutdown, not a crash.")
+            logger.info("[MAIN] Bot exited cleanly — restarting in 5s...")
+            time.sleep(5)
+            continue
+        except SystemExit:
+            # SystemExit = intentional shutdown (SIGTERM from Railway, etc.)
+            # Exit cleanly — Railway's ON_FAILURE policy will restart if needed.
+            logger = logging.getLogger(__name__)
+            logger.info("[MAIN] Bot exited via SystemExit — intentional shutdown.")
             break
         except KeyboardInterrupt:
             bot_console.print(f"\n[yellow]⚠️  Bot stopped by user[/yellow]")
@@ -10894,39 +10979,23 @@ if __name__ == "__main__":
         except MemoryError:
             gc.collect()
             crash_count += 1
-            backoff = CRASH_BACKOFFS[min(crash_count - 1, len(CRASH_BACKOFFS) - 1)]
-            bot_console.print(f"[red]✘ Memory error (crash {crash_count}/{MAX_CRASH_RETRIES}) — forcing GC and restarting in {backoff}s...[/red]")
+            # If bot ran >10 min before crashing, reset backoff (transient OOM)
+            run_duration = time.time() - _last_main_start
+            if run_duration > 600:
+                crash_count = 1
+            backoff_s = CRASH_BACKOFFS[min(crash_count - 1, len(CRASH_BACKOFFS) - 1)]
             logger = logging.getLogger(__name__)
-            logger.error(f"[MAIN] ✘ Memory error (crash {crash_count}/{MAX_CRASH_RETRIES}) — restarting in {backoff}s...")
-            time.sleep(backoff)
+            logger.error(f"[MAIN] ✘ Memory error (crash #{crash_count}, ran {int(run_duration)}s) — restarting in {backoff_s}s...")
+            bot_console.print(f"[red]✘ Memory error — restarting in {backoff_s}s...[/red]")
+            time.sleep(backoff_s)
         except Exception as e:
             crash_count += 1
+            run_duration = time.time() - _last_main_start
+            # If bot ran >10 min before crashing, reset backoff (transient error)
+            if run_duration > 600:
+                crash_count = 1
             logger = logging.getLogger(__name__)
-            logger.error(f"[MAIN] ✘ Unexpected error (crash {crash_count}/{MAX_CRASH_RETRIES}): {e}", exc_info=True)
-            backoff = CRASH_BACKOFFS[min(crash_count - 1, len(CRASH_BACKOFFS) - 1)]
-            bot_console.print(f"[red]✘ Restarting in {backoff}s... (attempt {crash_count}/{MAX_CRASH_RETRIES})[/red]")
-            logger.error(f"[MAIN] Retry {crash_count}/{MAX_CRASH_RETRIES} in {backoff}s...")
-            time.sleep(backoff)
-    else:
-        # ── All retries exhausted — exit cleanly, DON'T trigger redeploy ──
-        # Previously triggered _railway_redeploy() which caused ANOTHER restart,
-        # creating double-restart loops with Railway's own policy. That overheat
-        # loop is exactly what we're fixing. Now we just exit — the user can
-        # restart manually or Railway's restartPolicy handles it with long cooldown.
-        logger = logging.getLogger(__name__)
-        logger.error(f"[MAIN] ✘ Bot crashed {MAX_CRASH_RETRIES} times — exiting cleanly to prevent overheat loop.")
-        bot_console.print(f"[bold red]✘ Crashed {MAX_CRASH_RETRIES} times — exiting cleanly (no auto-redeploy to prevent overheat).[/bold red]")
-
-        try:
-            _tg_send(BOT_TOKEN, OWNER_ID,
-                f"🛑 <b>Bot Stopped After {MAX_CRASH_RETRIES} Crashes</b>\n\n"
-                f"Auto-restart disabled to prevent overheat.\n"
-                f"Check Railway logs for root cause.\n\n"
-                f"🔄 <b>Restart manually when ready.</b>"
-            )
-            time.sleep(3)
-        except Exception:
-            pass
-
-        # Just exit — do NOT trigger _railway_redeploy() or os.execv.
-        # This prevents the restart loop that was overheating Railway.
+            logger.error(f"[MAIN] ✘ Unexpected error (crash #{crash_count}, ran {int(run_duration)}s): {e}", exc_info=True)
+            backoff_s = CRASH_BACKOFFS[min(crash_count - 1, len(CRASH_BACKOFFS) - 1)]
+            bot_console.print(f"[red]✘ Restarting in {backoff_s}s... (crash #{crash_count})[/red]")
+            time.sleep(backoff_s)
