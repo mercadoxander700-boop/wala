@@ -1,0 +1,15 @@
+# Choreo component configuration for the Telegram Bot
+# This file tells Choreo how to expose and monitor the bot's healthcheck endpoint.
+# File location: .choreo/component.yaml (relative to build context root)
+
+schemaVersion: 1.2
+
+endpoints:
+  - name: bot-health
+    displayName: Bot Healthcheck
+    service:
+      basePath: /
+      port: 8080
+    type: REST
+    networkVisibilities:
+      - Project
