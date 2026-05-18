@@ -1,0 +1,50 @@
+name: Keep Codespace Alive
+
+on:
+  schedule:
+    # Run every 25 minutes to prevent idle timeout (default 30 min)
+    - cron: '*/25 * * * *'
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Keep codespace alive
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.CODESPACE_PAT }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            // List active codespaces
+            try {
+              const { data: codespaces } = await github.rest.codespaces.listForAuthenticatedUser();
+              const active = codespaces.codespaces.filter(
+                cs => cs.repository.full_name === `${owner}/${repo}` && cs.state === 'Available'
+              );
+
+              if (active.length === 0) {
+                console.log('No active codespaces found for this repo. Trying to start the most recent one...');
+                const all = codespaces.codespaces.filter(
+                  cs => cs.repository.full_name === `${owner}/${repo}`
+                );
+                if (all.length > 0) {
+                  const latest = all.sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
+                  console.log(`Starting codespace: ${latest.name}`);
+                  await github.rest.codespaces.startForAuthenticatedUser({
+                    codespace_name: latest.name
+                  });
+                  console.log('Codespace start triggered.');
+                } else {
+                  console.log('No codespaces exist for this repo.');
+                }
+              } else {
+                for (const cs of active) {
+                  console.log(`Codespace ${cs.name} is active (state: ${cs.state})`);
+                }
+              }
+            } catch (error) {
+              console.log(`Error: ${error.message}`);
+            }

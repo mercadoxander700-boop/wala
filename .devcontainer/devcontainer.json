@@ -1,0 +1,14 @@
+{
+  "name": "Garena Bot",
+  "image": "mcr.microsoft.com/devcontainers/python:3.11",
+  "postCreateCommand": "pip install -r requirements.txt",
+  "postStartCommand": "nohup python main.py > /tmp/bot.log 2>&1 &",
+  "forwardPorts": [8080],
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    }
+  }
+}
