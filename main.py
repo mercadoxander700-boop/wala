@@ -30,6 +30,44 @@ try:
         logging.getLogger(__name__).debug(f"[ENV] Loaded .env from {_env_path}")
 except ImportError:
     pass  # python-dotenv not installed — skip
+
+# ── Early healthcheck server (starts BEFORE all other init) ──────────────────
+# Railway needs /health to respond within healthcheckTimeout (300s).
+# If the server only starts in main(), module-level init (config, proxies, etc.)
+# can block or crash before main() is ever reached — causing Healthcheck Failure.
+# Starting it here ensures Railway gets a 200 ASAP, even during slow startup.
+_early_healthcheck_server = None
+def _start_early_healthcheck():
+    """Start healthcheck server at import time — before any other initialization.
+    This ensures Railway's /health probe succeeds even if later init is slow."""
+    global _early_healthcheck_server
+    port_str = os.environ.get("PORT", "")
+    if not port_str or not port_str.isdigit():
+        return  # No PORT — not on Railway, skip
+    port = int(port_str)
+    try:
+        from http.server import HTTPServer, BaseHTTPRequestHandler
+        class _EarlyHealthHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path in ("/health", "/", "/healthz"):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"status":"starting","message":"bot is initializing"}')
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+            def log_message(self, format, *args):
+                pass  # suppress request logs
+        server = HTTPServer(("0.0.0.0", port), _EarlyHealthHandler)
+        _early_healthcheck_server = server
+        import threading
+        threading.Thread(target=server.serve_forever, daemon=True, name="EarlyHealthcheck").start()
+    except Exception:
+        pass  # If this fails, the later healthcheck in main() will try again
+_start_early_healthcheck()
+# ── End early healthcheck ────────────────────────────────────────────────────
+
 import cloudscraper
 import colorama
 import threading
@@ -10064,7 +10102,10 @@ _healthcheck_server = None  # reference to HTTPServer for cleanup
 def _start_healthcheck_server():
     """Start a lightweight HTTP server for healthchecks.
     Responds 200 if bot is alive, 503 if the main loop appears stuck.
-    Works with Railway and any platform that sets PORT."""
+    Works with Railway and any platform that sets PORT.
+    If the early healthcheck server is already running, upgrades it with
+    full liveness tracking."""
+    global _healthcheck_server, _early_healthcheck_server
     from http.server import HTTPServer, BaseHTTPRequestHandler
     import traceback
 
@@ -10074,11 +10115,20 @@ def _start_healthcheck_server():
         logger.debug("[HEALTH] No PORT env var — healthcheck server disabled")
         return
 
+    # If the early healthcheck server is running, shut it down first
+    # so we can replace it with the full-featured one
+    if _early_healthcheck_server is not None:
+        try:
+            _early_healthcheck_server.shutdown()
+            _early_healthcheck_server = None
+            logger.info("[HEALTH] Replaced early healthcheck server with full version")
+        except Exception:
+            pass
+
     class HealthHandler(BaseHTTPRequestHandler):
         def do_GET(self):
-            if self.path == "/health":
+            if self.path in ("/health", "/", "/healthz"):
                 # During graceful shutdown, always return 503
-                # This tells Railway "I'm going down on purpose, don't panic"
                 if _shutting_down:
                     self.send_response(503)
                     self.send_header("Content-Type", "application/json")
@@ -10090,10 +10140,6 @@ def _start_healthcheck_server():
                     logger.info("[HEALTH] 503 — shutting down")
                     return
                 age = _get_liveness_age()
-                # If no liveness touch in 15 minutes → 503 (unhealthy)
-                # Was 5 min but that was too aggressive — caused Railway restart loops
-                # when the bot had brief network issues.
-                # 5-15 min range: return 200 but with "degraded" status (no restart)
                 if age > 900:
                     self.send_response(503)
                     self.send_header("Content-Type", "application/json")
@@ -10119,12 +10165,10 @@ def _start_healthcheck_server():
                 self.end_headers()
 
         def log_message(self, format, *args):
-            # Suppress default request logging to keep terminal clean
             pass
 
     try:
         server = HTTPServer(("0.0.0.0", port), HealthHandler)
-        global _healthcheck_server
         _healthcheck_server = server
         threading.Thread(target=server.serve_forever, daemon=True, name="HealthcheckServer").start()
         logger.info(f"[HEALTH] ✅ Healthcheck server listening on :{port}/health")
