@@ -1957,7 +1957,7 @@ def prelogin(session, account, datadome_manager, telegram_config=None):
             try:
                 data = response.json()
             except json.JSONDecodeError:
-                logger.error(f"      ✗ Invalid response format")
+                logger.debug(f"      ✗ Invalid response format")
                 # Check if response looks like a DataDome challenge
                 resp_text = response.text[:200] if response.text else ""
                 if "captcha-delivery" in resp_text:
@@ -1980,14 +1980,14 @@ def prelogin(session, account, datadome_manager, telegram_config=None):
                         datadome_manager.refresh_datadome(session)
                         backoff(attempt)
                         continue
-                logger.error(f"      ✗ Error: {error_msg}")
+                logger.debug(f"      ✗ Error: {error_msg}")
                 return None, None, new_datadome
                 
             v1 = data.get('v1')
             v2 = data.get('v2')
             
             if not v1 or not v2:
-                logger.error(f"      ✗ Missing authentication data")
+                logger.debug(f"      ✗ Missing authentication data")
                 return None, None, new_datadome
                 
             logger.info(f"   ✔ Prelogin successful")
@@ -2024,30 +2024,30 @@ def prelogin(session, account, datadome_manager, telegram_config=None):
                     if datadome_manager.handle_403(session, telegram_config=telegram_config):
                         return "IP_BLOCKED", None, None
                     else:
-                        logger.error(f"      🚨 DataDome block unrecoverable")
+                        logger.debug(f"      🚨 DataDome block unrecoverable")
                         return None, None, new_cookies.get('datadome')
                 else:
-                    logger.error(f"      ✗ HTTP {e.response.status_code}")
+                    logger.debug(f"      ✗ HTTP {e.response.status_code}")
             else:
-                logger.error(f"      ✗ Connection error")
+                logger.debug(f"      ✗ Connection error")
                 
             if attempt < retries - 1:
                 backoff(attempt)
                 continue
         except requests.exceptions.ConnectionError as e:
-            logger.warning(f"      🔌 Proxy dead/rate-limited: {str(e)[:80]}")
+            logger.debug(f"      🔌 Proxy dead/rate-limited: {str(e)[:80]}")
             return "CONN_ERROR", None, None
 
         except requests.exceptions.Timeout as e:
-            logger.warning(f"      ⏱️ Proxy timeout: {str(e)[:80]}")
+            logger.debug(f"      ⏱️ Proxy timeout: {str(e)[:80]}")
             return "CONN_ERROR", None, None
 
         except Exception as e:
             err = str(e)
             if any(kw in err for kw in ('ConnectionPool', 'HTTPSConnection', 'Max retries', 'RemoteDisconnected', 'Connection refused', 'ProxyError', 'SOCKS')):
-                logger.warning(f"      🔌 Proxy connection failed: {err[:80]}")
+                logger.debug(f"      🔌 Proxy connection failed: {err[:80]}")
                 return "CONN_ERROR", None, None
-            logger.error(f"      💥 Unexpected error: {err[:50]}")
+            logger.debug(f"      💥 Unexpected error: {err[:50]}")
             if attempt < retries - 1:
                 backoff(attempt)
                 
@@ -2117,7 +2117,7 @@ def login(session, account, password, v1, v2):
             try:
                 data = response.json()
             except json.JSONDecodeError:
-                logger.error(f"      ✘ Invalid JSON response from login")
+                logger.debug(f"      ✘ Invalid JSON response from login")
                 if attempt < retries - 1:
                     backoff(attempt)
                     continue
@@ -2129,31 +2129,31 @@ def login(session, account, password, v1, v2):
                 error_msg = data['error']
                 
                 if error_msg == 'ACCOUNT DOESNT EXIST':
-                    logger.warning(f"     ✘ Login failed: Invalid credentials")
-                    logger.warning(f"         └─ 🔑 Reason: {error_msg}")
+                    logger.debug(f"     ✘ Login failed: Invalid credentials")
+                    logger.debug(f"         └─ 🔑 Reason: {error_msg}")
                     return None
                 elif 'captcha' in error_msg.lower():
-                    logger.warning(f"     ✘ Login failed: Captcha required — rotating proxy")
-                    logger.warning(f"         └─ 🤖 Reason: {error_msg}")
+                    logger.debug(f"     ✘ Login failed: Captcha required — rotating proxy")
+                    logger.debug(f"         └─ 🤖 Reason: {error_msg}")
                     geo_rotator.force_rotate()
                     session.proxies.update(geo_rotator.get_proxies())
                     backoff(attempt)
                     continue
                 else:
-                    logger.warning(f"     ✘ Login failed: Invalid credentials")
-                    logger.warning(f"         └─ ⚠️ Reason: {error_msg}")
+                    logger.debug(f"     ✘ Login failed: Invalid credentials")
+                    logger.debug(f"         └─ ⚠️ Reason: {error_msg}")
                     return None
                     
             return sso_key
             
         except (requests.exceptions.ConnectionError, requests.exceptions.ProxyError) as e:
-            logger.warning(f"      🔌 Proxy dead/rate-limited on login — removing proxy: {str(e)[:80]}")
+            logger.debug(f"      🔌 Proxy dead/rate-limited on login — removing proxy: {str(e)[:80]}")
             geo_rotator.force_rotate()
             session.proxies.update(geo_rotator.get_proxies())
             if attempt < retries - 1:
                 backoff(attempt)
         except requests.RequestException as e:
-            logger.error(f"      ✘ Login request failed (attempt {attempt + 1}): {e}")
+            logger.debug(f"      ✘ Login request failed (attempt {attempt + 1}): {e}")
             if attempt < retries - 1:
                 backoff(attempt)
                 
@@ -2706,7 +2706,7 @@ def processaccount(session, account, password, cookie_manager, datadome_manager,
             break  # prelogin succeeded or hard-failed — exit retry loop
 
         if v1 in ("IP_BLOCKED", "CONN_ERROR"):
-            logger.error(f"[RETRY] Exhausted {MAX_IP_BLOCK_RETRIES} retries for {account} — skipping")
+            logger.debug(f"[RETRY] Exhausted {MAX_IP_BLOCK_RETRIES} retries for {account} — skipping")
             live_stats.update_stats(valid=False)
             reason = "🛡️ DataDome blocked" if v1 == "IP_BLOCKED" else "🔌 Proxy exhausted"
             return f"🚨 {reason} - Skipped after {MAX_IP_BLOCK_RETRIES} retries"
@@ -2759,13 +2759,13 @@ def processaccount(session, account, password, cookie_manager, datadome_manager,
             try:
                 account_data = response.json()
             except json.JSONDecodeError:
-                logger.error(f"      ✘ Invalid JSON response from account init")
+                logger.debug(f"      ✘ Invalid JSON response from account init")
                 live_stats.update_stats(valid=False)
                 return ""
             break  # success
 
         if account_data is None:
-            logger.error(f"[INIT] ❌ Failed account/init after all retries — skipping")
+            logger.debug(f"[INIT] Failed account/init after all retries — skipping")
             live_stats.update_stats(valid=False)
             return f"🚨 IP Blocked - account/init failed after retries"
 
@@ -2774,7 +2774,7 @@ def processaccount(session, account, password, cookie_manager, datadome_manager,
                 live_stats.update_stats(valid=False)
                 return ""
             live_stats.update_stats(valid=False)
-            logger.error(f"      ✘ Error fetching details: {account_data['error']}")
+            logger.debug(f"      ✘ Error fetching details: {account_data['error']}")
             return ""
         
         if 'user_info' in account_data:
@@ -3668,11 +3668,11 @@ def _tg_api(token: str, method: str, **kwargs):
             if r.status_code == 429:
                 # Rate-limited — honour Retry-After header if present
                 retry_after = int(r.headers.get("Retry-After", 5))
-                logger.warning(f"[BOT] {method} rate-limited — waiting {retry_after}s (attempt {attempt+1}/3)")
+                logger.debug(f"[BOT] {method} rate-limited — waiting {retry_after}s (attempt {attempt+1}/3)")
                 time.sleep(retry_after)
                 continue
             if r.status_code != 200:
-                logger.warning(f"[BOT] {method} HTTP {r.status_code}: {r.text[:200]}")
+                logger.debug(f"[BOT] {method} HTTP {r.status_code}: {r.text[:200]}")
                 return None
             data = r.json()
             if not data.get("ok"):
@@ -3683,10 +3683,10 @@ def _tg_api(token: str, method: str, **kwargs):
                     logger.warning(f"[BOT] {method} Telegram error [{err_code}]: {err}")
             return data
         except requests.exceptions.Timeout:
-            logger.warning(f"[BOT] {method} timeout (attempt {attempt+1}/3)")
+            logger.debug(f"[BOT] {method} timeout (attempt {attempt+1}/3)")
             time.sleep(2)
         except Exception as e:
-            logger.warning(f"[BOT] {method} error: {e}")
+            logger.debug(f"[BOT] {method} error: {e}")
             return None
     return None
 
@@ -5063,16 +5063,14 @@ class _BotLogFilter(logging.Filter):
     ALLOWED_PREFIXES = (
         "[RAW-PROXY]",
         "[PROXY-VAL]",
-        "[HEARTBEAT]",
         "[MAIN]",
-        "[DATADOME]",
     )
 
     def filter(self, record):
         if not BOT_MODE:
             return True
-        # Always allow ERROR and CRITICAL level messages
-        if record.levelno >= logging.ERROR:
+        # Only allow CRITICAL level messages (suppress ERROR spam from per-account processing)
+        if record.levelno >= logging.CRITICAL:
             return True
         # Allow specific important prefixes
         msg = record.getMessage()
@@ -10483,21 +10481,21 @@ def start_bot_polling(token: str, _unused=None):
 
                 if r.status_code == 429:
                     retry_after = int(r.headers.get("Retry-After", 10))
-                    logger.warning(f"[BOT] Polling rate-limited — sleeping {retry_after}s")
+                    logger.debug(f"[BOT] Polling rate-limited — sleeping {retry_after}s")
                     time.sleep(retry_after)
                     continue
                 if r.status_code == 409:
-                    logger.warning("[BOT] Conflict (409) — another bot instance running? Retrying in 3s")
+                    logger.debug("[BOT] Conflict (409) — another bot instance running? Retrying in 3s")
                     time.sleep(3)
                     continue
                 if r.status_code != 200:
-                    logger.warning(f"[BOT] getUpdates HTTP {r.status_code} — retrying in 5s")
+                    logger.debug(f"[BOT] getUpdates HTTP {r.status_code} — retrying in 5s")
                     time.sleep(5)
                     continue
                 try:
                     payload = r.json()
                 except ValueError:
-                    logger.warning("[BOT] getUpdates returned non-JSON response — retrying in 5s")
+                    logger.debug("[BOT] getUpdates returned non-JSON response — retrying in 5s")
                     time.sleep(5)
                     continue
                 for upd in payload.get("result", []):
@@ -10513,7 +10511,7 @@ def start_bot_polling(token: str, _unused=None):
                 consecutive_errors += 1
                 _touch_liveness()  # bot is alive, just network issues
                 wait = min(5 * consecutive_errors, 30)
-                logger.warning(f"[BOT] Connection error #{consecutive_errors}: {e} — retrying in {wait}s")
+                logger.debug(f"[BOT] Connection error #{consecutive_errors}: {e} — retrying in {wait}s")
                 time.sleep(wait)
                 # Recreate session after 3 consecutive connection errors
                 if consecutive_errors >= 3:
@@ -10527,7 +10525,7 @@ def start_bot_polling(token: str, _unused=None):
             except Exception as e:
                 consecutive_errors += 1
                 _touch_liveness()  # bot process is alive, just poll error
-                logger.warning(f"[BOT] Poll error: {e}")
+                logger.debug(f"[BOT] Poll error: {e}")
                 time.sleep(5)
 
     threading.Thread(target=_poll, daemon=True).start()
@@ -11004,7 +11002,7 @@ def main():
                         logger.info(f"[WATCHDOG] Bot recovered — liveness age {int(age)}s")
                     stuck_warned = False
                     restart_loop_count = 0
-                    logger.info(f"[HEARTBEAT] Bot alive | {active} active | liveness: {int(age)}s ago | threads: {MAX_GLOBAL_THREADS}")
+                    logger.debug(f"[HEARTBEAT] Bot alive | {active} active | liveness: {int(age)}s ago | threads: {MAX_GLOBAL_THREADS}")
             except Exception:
                 pass
     threading.Thread(target=_liveness_watchdog, daemon=True, name="LivenessWatchdog").start()
